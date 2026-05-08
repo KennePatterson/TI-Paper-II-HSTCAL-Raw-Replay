@@ -1,0 +1,103 @@
+name: TI Paper II HSTCAL Raw-to-FLT Replay
+
+on:
+  workflow_dispatch:
+    inputs:
+      raw_package_url:
+        description: "URL to TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip"
+        required: false
+        default: "https://github.com/KennePatterson/TI-Paper-II-HSTCAL-Raw-Replay/releases/download/v0.1-raw-package/TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip"
+        type: string
+      stenv_yaml_url:
+        description: "Official stenv Linux X64 release YAML URL"
+        required: false
+        default: "https://github.com/spacetelescope/stenv/releases/download/2026.04.14/stenv-Linux-X64-py3.14-2026.04.14.yaml"
+        type: string
+      stenv_yaml_sha256:
+        description: "Expected SHA256 for stenv release YAML"
+        required: false
+        default: "fa15acead034b3719e11f128341a9a5f7bce8050dfcce05526110f0456be2f0f"
+        type: string
+      stenv_yaml_filename:
+        description: "stenv release YAML filename"
+        required: false
+        default: "stenv-Linux-X64-py3.14-2026.04.14.yaml"
+        type: string
+      crds_context:
+        description: "Optional CRDS_CONTEXT for exact-context replay. Leave blank for current context."
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  raw-to-flt-replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install micromamba
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          init-shell: bash
+          cache-environment: false
+          post-cleanup: all
+
+      - name: Fetch stenv release YAML
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L "${{ github.event.inputs.stenv_yaml_url }}" -o "${{ github.event.inputs.stenv_yaml_filename }}"
+          echo "${{ github.event.inputs.stenv_yaml_sha256 }}  ${{ github.event.inputs.stenv_yaml_filename }}" | sha256sum -c -
+          ls -lah "${{ github.event.inputs.stenv_yaml_filename }}"
+
+      - name: Create official stenv environment
+        shell: bash -l {0}
+        run: |
+          set -euo pipefail
+          micromamba env create --name stenv-ti --file "${{ github.event.inputs.stenv_yaml_filename }}" --use-uv
+          micromamba run -n stenv-ti python -V
+          micromamba run -n stenv-ti bash -lc 'which calwf3.e || which calwf3'
+          micromamba run -n stenv-ti bash -lc 'which crds || true'
+          micromamba run -n stenv-ti python - <<'PY'
+          import crds
+          print("crds", getattr(crds, "__version__", "unknown"))
+          try:
+              import drizzlepac
+              print("drizzlepac", getattr(drizzlepac, "__version__", "unknown"))
+          except Exception as exc:
+              print("drizzlepac_import_error", repr(exc))
+          PY
+
+      - name: Download true-science raw package
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L "${{ github.event.inputs.raw_package_url }}" -o TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip
+          sha256sum TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip | tee raw_package.sha256
+          echo "fa792f077f14a35756f10bfafd8401ca3e8e43dbd83e9f485b7077acb543de30  TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip" | sha256sum -c -
+
+      - name: Run HSTCAL raw-to-FLT/FLC replay
+        shell: bash -l {0}
+        env:
+          STENV_RELEASE: "2026.04.14"
+          STENV_YAML_FILENAME: ${{ github.event.inputs.stenv_yaml_filename }}
+          STENV_YAML_SHA256: ${{ github.event.inputs.stenv_yaml_sha256 }}
+          CRDS_SERVER_URL: https://hst-crds.stsci.edu
+          CRDS_PATH: ${{ github.workspace }}/crds_cache
+          CRDS_CONTEXT: ${{ github.event.inputs.crds_context }}
+          iref: ${{ github.workspace }}/crds_cache/references/hst/iref/
+        run: |
+          set -euo pipefail
+          micromamba run -n stenv-ti bash scripts/run_hstcal_replay.sh TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip ti_hstcal_replay_work
+
+      - name: Upload replay artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ti-paperii-hstcal-raw-to-flt-replay-results
+          path: |
+            raw_package.sha256
+            ti_hstcal_replay_work/results/**
+          if-no-files-found: error
