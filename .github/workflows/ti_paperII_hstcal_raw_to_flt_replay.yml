@@ -24,9 +24,9 @@ on:
         default: "stenv-Linux-X64-py3.12-2026.04.14.yaml"
         type: string
       crds_context:
-        description: "Optional CRDS_CONTEXT for exact-context replay. Leave blank for current context."
+        description: "CRDS_CONTEXT. Default is package/reference context hst_1313.pmap."
         required: false
-        default: ""
+        default: "hst_1313.pmap"
         type: string
 
 jobs:
