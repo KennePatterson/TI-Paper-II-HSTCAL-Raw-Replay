@@ -177,6 +177,7 @@ with fits.open(p, memmap=False) as hdul:
 PY
 
     SUCCESS=0
+
     MODES=(
       "bestrefs_context_plain"
       "no_bestrefs_plain"
