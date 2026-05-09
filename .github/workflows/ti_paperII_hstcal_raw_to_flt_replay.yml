@@ -68,15 +68,8 @@ jobs:
           micromamba run -n stenv-ti bash -lc 'which calwf3.e || which calwf3'
           micromamba run -n stenv-ti bash -lc 'which crds || true'
           micromamba run -n stenv-ti bash -lc 'ldd $(which calwf3.e || which calwf3) || true'
-          micromamba run -n stenv-ti python - <<'PY'
-import crds
-print("crds", getattr(crds, "__version__", "unknown"))
-try:
-    import drizzlepac
-    print("drizzlepac", getattr(drizzlepac, "__version__", "unknown"))
-except Exception as exc:
-    print("drizzlepac_import_error", repr(exc))
-PY
+          micromamba run -n stenv-ti python -c "import crds; print('crds', getattr(crds, '__version__', 'unknown'))"
+          micromamba run -n stenv-ti python -c "import importlib.util; spec=importlib.util.find_spec('drizzlepac'); print('drizzlepac_available', spec is not None)"
 
       - name: Download true-science raw package
         shell: bash
