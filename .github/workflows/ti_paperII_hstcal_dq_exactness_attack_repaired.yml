@@ -1,0 +1,103 @@
+name: TI Paper II HSTCAL DQ Literal Exactness Attack Repaired
+
+on:
+
+  workflow_dispatch:
+
+jobs:
+
+  dq_literal_exactness_attack:
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 360
+
+    steps:
+
+      - name: Checkout repo
+
+        uses: actions/checkout@v4
+
+      - name: System packages
+
+        run: |
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+
+            python3-pip \
+
+            wget \
+
+            curl \
+
+            unzip
+
+      - name: Python packages
+
+        run: |
+
+          python -m pip install --upgrade pip
+
+          pip install \
+
+            numpy \
+
+            pandas \
+
+            astropy
+
+      - name: Prepare directories
+
+        run: |
+
+          mkdir -p \
+
+            ti_hstcal_dq_exactness_work/results/logs \
+
+            ti_hstcal_dq_exactness_work/results/reports
+
+      - name: Execute repaired DQ exactness attack
+
+        run: |
+
+          python scripts/dq_exactness_repaired.py
+
+      - name: Assert required outputs exist
+
+        run: |
+
+          python scripts/assert_dq_exactness_artifacts.py
+
+      - name: Upload repaired artifact
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: ti-paperii-hstcal-dq-literal-exactness-attack-repaired-results
+
+          path: |
+
+            ti_hstcal_dq_exactness_work/results
+
+            dq_exactness_attack_decision.json
+
+            dq_exactness_by_root.csv
+
+            dq_exactness_by_bit.csv
+
+            dq_4096_direction_by_root.csv
+
+            science_overlap_audit.csv
+
+            dq_exactness_attack_summary.json
+
+            dq_exactness_attack_status.txt
+
+            astrodrizzle_update_attempt_summary.json
+
+            astrodrizzle_attempt_status.txt
+
+          if-no-files-found: error
