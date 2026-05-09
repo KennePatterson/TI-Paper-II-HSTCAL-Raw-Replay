@@ -7,7 +7,7 @@ STENV_RELEASE="${STENV_RELEASE:-2026.04.14}"
 STENV_YAML_FILENAME="${STENV_YAML_FILENAME:-}"
 STENV_YAML_SHA256="${STENV_YAML_SHA256:-}"
 
-echo "TI Paper II HSTCAL crash-forensics raw-to-FLT/FLC replay runner"
+echo "TI Paper II HSTCAL normalized-package raw-to-FLT/FLC replay runner"
 echo "UTC: $(date -u)"
 echo "Raw package ZIP: ${RAW_PACKAGE_ZIP}"
 echo "Work root: ${WORK_ROOT}"
@@ -19,17 +19,9 @@ fi
 
 rm -rf "${WORK_ROOT}"
 mkdir -p "${WORK_ROOT}"
-unzip -q "${RAW_PACKAGE_ZIP}" -d "${WORK_ROOT}/package_extract"
 
-PACKAGE_DIR="$(find "${WORK_ROOT}/package_extract" -maxdepth 5 -type f -name true_science_input_manifest.json -printf '%h\n' | head -n 1 || true)"
-if [[ -z "${PACKAGE_DIR}" || ! -d "${PACKAGE_DIR}" ]]; then
-  PACKAGE_DIR="$(find "${WORK_ROOT}/package_extract" -maxdepth 5 -type d -name data -printf '%h\n' | head -n 1 || true)"
-fi
-if [[ -z "${PACKAGE_DIR}" || ! -d "${PACKAGE_DIR}" ]]; then
-  echo "ERROR: could not locate extracted true-science package directory." >&2
-  find "${WORK_ROOT}/package_extract" -maxdepth 5 -type f | head -300 || true
-  exit 3
-fi
+EXTRACT_ROOT="${WORK_ROOT}/package_extract"
+unzip -q "${RAW_PACKAGE_ZIP}" -d "${EXTRACT_ROOT}"
 
 RESULTS_DIR="${WORK_ROOT}/results"
 GENERATED_DIR="${RESULTS_DIR}/generated"
@@ -37,29 +29,35 @@ LOG_DIR="${RESULTS_DIR}/logs"
 NORMALIZED_DIR="${RESULTS_DIR}/normalized_package"
 NORMALIZED_RAW_DIR="${NORMALIZED_DIR}/data/raw"
 NORMALIZED_CAL_DIR="${NORMALIZED_DIR}/data/calibrated_reference"
+NORMALIZED_ASSOC_DIR="${NORMALIZED_DIR}/data/association"
 
-mkdir -p "${RESULTS_DIR}" "${GENERATED_DIR}" "${LOG_DIR}" "${NORMALIZED_RAW_DIR}" "${NORMALIZED_CAL_DIR}"
+mkdir -p "${RESULTS_DIR}" "${GENERATED_DIR}" "${LOG_DIR}" "${NORMALIZED_RAW_DIR}" "${NORMALIZED_CAL_DIR}" "${NORMALIZED_ASSOC_DIR}"
 
 MASTER_LOG="${LOG_DIR}/calwf3_command_log.txt"
 
 {
-  echo "Package dir: ${PACKAGE_DIR}"
+  echo "Extract root: ${EXTRACT_ROOT}"
   echo "Host: $(uname -a || true)"
   echo "Python: $(python --version || true)"
   echo "Date UTC: $(date -u)"
   echo ""
 
   echo "Original package inventory:"
-  find "${PACKAGE_DIR}" -maxdepth 6 -type f | sort | sed 's#^#  #' || true
+  find "${EXTRACT_ROOT}" -maxdepth 8 -type f | sort | sed 's#^#  #' || true
   echo ""
 
-  echo "Normalizing mixed package layout..."
-  find "${PACKAGE_DIR}" -type f -name '*_raw.fits' -print0 | while IFS= read -r -d '' RAW_FILE; do
+  echo "Normalizing from entire extracted ZIP, not first package folder..."
+
+  find "${EXTRACT_ROOT}" -type f \( -name '*_raw.fits' -o -name '*_raw.fits.gz' \) -print0 | while IFS= read -r -d '' RAW_FILE; do
     cp -p "${RAW_FILE}" "${NORMALIZED_RAW_DIR}/$(basename "${RAW_FILE}")"
   done
 
-  find "${PACKAGE_DIR}" -type f \( -name '*_flt.fits' -o -name '*_flc.fits' \) -print0 | while IFS= read -r -d '' CAL_FILE; do
+  find "${EXTRACT_ROOT}" -type f \( -name '*_flt.fits' -o -name '*_flt.fits.gz' -o -name '*_flc.fits' -o -name '*_flc.fits.gz' \) -print0 | while IFS= read -r -d '' CAL_FILE; do
     cp -p "${CAL_FILE}" "${NORMALIZED_CAL_DIR}/$(basename "${CAL_FILE}")"
+  done
+
+  find "${EXTRACT_ROOT}" -type f \( -name '*_asn.fits' -o -name '*_asn.fits.gz' \) -print0 | while IFS= read -r -d '' ASN_FILE; do
+    cp -p "${ASN_FILE}" "${NORMALIZED_ASSOC_DIR}/$(basename "${ASN_FILE}")"
   done
 
   echo ""
@@ -145,22 +143,27 @@ MASTER_LOG="${LOG_DIR}/calwf3_command_log.txt"
   RAW_FILES=( "${NORMALIZED_RAW_DIR}"/*_raw.fits "${NORMALIZED_RAW_DIR}"/*_raw.fits.gz )
 
   echo ""
-  echo "Starting per-root crash-forensics replay..."
+  echo "Starting per-root normalized replay..."
   echo "Will process ${#RAW_FILES[@]} normalized raw files."
+
+  SUCCESS_COUNT=0
+  FAILURE_COUNT=0
 
   for RAW in "${RAW_FILES[@]}"; do
     BASE="$(basename "${RAW}")"
     ROOT="${BASE%%_raw.fits}"
     ROOT="${ROOT%%_raw.fits.gz}"
+
     ROOT_RESULT_DIR="${GENERATED_DIR}/${ROOT}"
     mkdir -p "${ROOT_RESULT_DIR}"
+    ROOT_RESULT_DIR_ABS="$(cd "${ROOT_RESULT_DIR}" && pwd -P)"
 
     echo ""
     echo "================================================================================"
     echo "ROOT ${ROOT}"
     echo "================================================================================"
     echo "Raw: ${RAW}"
-    echo "Root result dir: ${ROOT_RESULT_DIR}"
+    echo "Root result dir: ${ROOT_RESULT_DIR_ABS}"
 
     python - <<PY || true
 from astropy.io import fits
@@ -210,13 +213,14 @@ PY
           WORK_DIR="${ROOT_RESULT_DIR}/${MODE}_${SAFE_EXE}_${SAFE_IREF}"
           rm -rf "${WORK_DIR}"
           mkdir -p "${WORK_DIR}"
-          cp -p "${RAW}" "${WORK_DIR}/${ROOT}_raw.fits"
+          WORK_DIR_ABS="$(cd "${WORK_DIR}" && pwd -P)"
+          cp -p "${RAW}" "${WORK_DIR_ABS}/${ROOT}_raw.fits"
 
           echo ""
           echo "---- Attempt ROOT=${ROOT} IREF=${iref} MODE=${MODE} EXE=${CAL_EXE} ----"
-          echo "Work dir: ${WORK_DIR}"
+          echo "Work dir: ${WORK_DIR_ABS}"
 
-          pushd "${WORK_DIR}" >/dev/null
+          pushd "${WORK_DIR_ABS}" >/dev/null
 
           if [[ "${MODE}" == bestrefs_context_* || "${MODE}" == gdb_bestrefs_plain ]]; then
             if command -v crds >/dev/null 2>&1; then
@@ -249,23 +253,20 @@ PY
           ls -lah || true
 
           FOUND_OUTPUT=""
-          if [[ -f "${ROOT}_flt.fits" ]]; then
-            FOUND_OUTPUT="${WORK_DIR}/${ROOT}_flt.fits"
-          elif [[ -f "${ROOT}_flc.fits" ]]; then
-            FOUND_OUTPUT="${WORK_DIR}/${ROOT}_flc.fits"
-          else
-            CAND="$(ls *_flt.fits *_flc.fits 2>/dev/null | head -n 1 || true)"
-            if [[ -n "${CAND}" && -f "${CAND}" ]]; then
-              FOUND_OUTPUT="${WORK_DIR}/${CAND}"
+
+          for CAND in "${ROOT}_flt.fits" "${ROOT}_flc.fits" *_flt.fits *_flc.fits; do
+            if [[ -f "${CAND}" ]]; then
+              FOUND_OUTPUT="$(pwd -P)/${CAND}"
+              break
             fi
-          fi
+          done
 
           if [[ -n "${FOUND_OUTPUT}" && -f "${FOUND_OUTPUT}" ]]; then
             echo "SUCCESS: generated calibrated output ${FOUND_OUTPUT}"
-            cp -p "${FOUND_OUTPUT}" "${ROOT_RESULT_DIR}/$(basename "${FOUND_OUTPUT}")"
-            echo "${MODE}" > "${ROOT_RESULT_DIR}/winning_mode.txt"
-            echo "${CAL_EXE}" > "${ROOT_RESULT_DIR}/winning_executable.txt"
-            echo "${iref}" > "${ROOT_RESULT_DIR}/winning_iref.txt"
+            cp -p "${FOUND_OUTPUT}" "${ROOT_RESULT_DIR_ABS}/$(basename "${FOUND_OUTPUT}")"
+            echo "${MODE}" > "${ROOT_RESULT_DIR_ABS}/winning_mode.txt"
+            echo "${CAL_EXE}" > "${ROOT_RESULT_DIR_ABS}/winning_executable.txt"
+            echo "${iref}" > "${ROOT_RESULT_DIR_ABS}/winning_iref.txt"
             SUCCESS=1
           else
             echo "No generated FLT/FLC output for ${ROOT} in mode=${MODE} exe=${CAL_EXE} iref=${iref}"
@@ -276,10 +277,17 @@ PY
       done
     done
 
-    if [[ "${SUCCESS}" -ne 1 ]]; then
+    if [[ "${SUCCESS}" -eq 1 ]]; then
+      SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    else
+      FAILURE_COUNT=$((FAILURE_COUNT + 1))
       echo "ROOT ${ROOT}: all HSTCAL attempts failed to produce FLT/FLC."
     fi
   done
+
+  echo ""
+  echo "Replay success count: ${SUCCESS_COUNT}"
+  echo "Replay failure count: ${FAILURE_COUNT}"
 
   echo ""
   echo "Generated product inventory:"
