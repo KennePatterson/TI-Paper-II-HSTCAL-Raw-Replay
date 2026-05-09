@@ -1,0 +1,763 @@
+name: TI Paper II HSTCAL DQ Direct Forensics
+
+on:
+  workflow_dispatch:
+    inputs:
+      raw_package_url:
+        description: "URL to true-science raw package"
+        required: false
+        default: "https://github.com/KennePatterson/TI-Paper-II-HSTCAL-Raw-Replay/releases/download/v0.1-raw-package/TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip"
+        type: string
+      raw_package_sha256:
+        description: "Expected SHA256 for true-science raw package"
+        required: false
+        default: "fa792f077f14a35756f10bfafd8401ca3e8e43dbd83e9f485b7077acb543de30"
+        type: string
+      stenv_yaml_url:
+        description: "Official stenv Linux X64 release YAML URL"
+        required: false
+        default: "https://github.com/spacetelescope/stenv/releases/download/2026.04.14/stenv-Linux-X64-py3.13-2026.04.14.yaml"
+        type: string
+      stenv_yaml_sha256:
+        description: "Expected SHA256 for stenv release YAML"
+        required: false
+        default: "2f967290c3c9fe2a4b3911022a737d91cea72f52f0115ecacb4b1d355ad82cb8"
+        type: string
+      stenv_yaml_filename:
+        description: "stenv release YAML filename"
+        required: false
+        default: "stenv-Linux-X64-py3.13-2026.04.14.yaml"
+        type: string
+      crds_context:
+        description: "CRDS_CONTEXT"
+        required: false
+        default: "hst_1313.pmap"
+        type: string
+
+jobs:
+  dq-direct-forensics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install diagnostics tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gdb file binutils || true
+
+      - name: Install micromamba
+        uses: mamba-org/setup-micromamba@v3
+        with:
+          init-shell: bash
+          cache-environment: false
+          post-cleanup: all
+
+      - name: Fetch stenv release YAML
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L "${{ github.event.inputs.stenv_yaml_url }}" -o "${{ github.event.inputs.stenv_yaml_filename }}"
+          echo "${{ github.event.inputs.stenv_yaml_sha256 }}  ${{ github.event.inputs.stenv_yaml_filename }}" | sha256sum -c -
+
+      - name: Create official stenv environment
+        shell: bash -l {0}
+        run: |
+          set -euo pipefail
+          micromamba env create --name stenv-ti --file "${{ github.event.inputs.stenv_yaml_filename }}" --use-uv
+          micromamba run -n stenv-ti python -V
+          micromamba run -n stenv-ti bash -lc 'which calwf3.e || which calwf3'
+          micromamba run -n stenv-ti bash -lc 'which crds || true'
+          micromamba run -n stenv-ti python -c "import astropy, numpy, crds; print('astropy', astropy.__version__); print('numpy', numpy.__version__); print('crds', getattr(crds, '__version__', 'unknown'))"
+
+      - name: Download true-science raw package
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L "${{ github.event.inputs.raw_package_url }}" -o TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip
+          sha256sum TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip | tee raw_package.sha256
+          echo "${{ github.event.inputs.raw_package_sha256 }}  TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip" | sha256sum -c -
+
+      - name: Write direct DQ forensics script
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ti_direct_scripts
+
+          cat > ti_direct_scripts/dq_direct_forensics.py <<'PY'
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+
+import numpy as np
+from astropy.io import fits
+
+SCIENCE_EXTENSIONS = ["SCI", "ERR", "SAMP", "TIME"]
+ALL_EXTENSIONS = ["SCI", "ERR", "SAMP", "TIME", "DQ"]
+
+def now_utc():
+    return datetime.now(timezone.utc).isoformat()
+
+def mkdirp(path):
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def write_json(path, obj):
+    mkdirp(os.path.dirname(path))
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+def write_csv(path, rows, columns):
+    mkdirp(os.path.dirname(path))
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=columns)
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: row.get(k, "") for k in columns})
+
+def root_from_name(path):
+    name = os.path.basename(path)
+    m = re.match(r"(.+?)_(?:raw|flt|flc)\.fits(?:\.gz)?$", name, re.IGNORECASE)
+    return m.group(1) if m else None
+
+def list_files(root, suffixes):
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            low = fn.lower()
+            if any(low.endswith(s.lower()) for s in suffixes):
+                out.append(os.path.join(dirpath, fn))
+    return sorted(out)
+
+def build_reference_map(package_dir):
+    cal_dir = os.path.join(package_dir, "data", "calibrated_reference")
+    ref = {}
+    for p in list_files(cal_dir, ["_flt.fits", "_flc.fits"]):
+        r = root_from_name(p)
+        if r:
+            ref[r] = p
+    return ref
+
+def build_generated_map(generated_dir):
+    gen = {}
+    for p in list_files(generated_dir, ["_flt.fits", "_flc.fits"]):
+        r = root_from_name(p)
+        if r:
+            gen[r] = p
+    return gen
+
+def get_ext_data(hdul, extname):
+    for idx, hdu in enumerate(hdul):
+        name = str(hdu.header.get("EXTNAME", "")).upper().strip()
+        if name == extname and hdu.data is not None:
+            return idx, hdu.header.get("EXTVER"), hdu.data
+    return None, None, None
+
+def diff_stats(gen_data, ref_data):
+    if gen_data is None or ref_data is None:
+        return {"present": False, "shape_match": False, "exact": False}
+    if gen_data.shape != ref_data.shape:
+        return {
+            "present": True,
+            "shape_match": False,
+            "exact": False,
+            "generated_shape": list(gen_data.shape),
+            "reference_shape": list(ref_data.shape),
+        }
+
+    if np.issubdtype(gen_data.dtype, np.floating) or np.issubdtype(ref_data.dtype, np.floating):
+        equal = (gen_data == ref_data) | (np.isnan(gen_data) & np.isnan(ref_data))
+        diff = np.abs(gen_data.astype(np.float64) - ref_data.astype(np.float64))
+        diff[np.isnan(diff)] = 0.0
+    else:
+        equal = gen_data == ref_data
+        diff = np.abs(gen_data.astype(np.int64) - ref_data.astype(np.int64)).astype(np.float64)
+
+    changed = ~equal
+    changed_count = int(np.count_nonzero(changed))
+    total = int(gen_data.size)
+
+    return {
+        "present": True,
+        "shape_match": True,
+        "exact": changed_count == 0,
+        "changed_pixel_count": changed_count,
+        "total_pixel_count": total,
+        "changed_pixel_fraction": float(changed_count / total) if total else None,
+        "max_abs_diff": float(np.max(diff)) if diff.size else None,
+        "median_abs_diff": float(np.median(diff)) if diff.size else None,
+        "p99_abs_diff": float(np.quantile(diff, 0.99)) if diff.size else None,
+        "rmse": float(np.sqrt(np.mean(diff ** 2))) if diff.size else None,
+    }
+
+def dq_bitplane_stats(gen_dq, ref_dq):
+    if gen_dq is None or ref_dq is None:
+        return {"dq_present": False, "dq_shape_match": False}
+    if gen_dq.shape != ref_dq.shape:
+        return {
+            "dq_present": True,
+            "dq_shape_match": False,
+            "generated_shape": list(gen_dq.shape),
+            "reference_shape": list(ref_dq.shape),
+        }
+
+    g = gen_dq.astype(np.uint64)
+    r = ref_dq.astype(np.uint64)
+    xor = np.bitwise_xor(g, r)
+    neq = xor != 0
+
+    mismatch_count = int(np.count_nonzero(neq))
+    total = int(xor.size)
+    mismatch_fraction = float(mismatch_count / total) if total else None
+
+    if mismatch_count:
+        xor_values, xor_counts = np.unique(xor[neq], return_counts=True)
+        gen_values, gen_counts = np.unique(g[neq], return_counts=True)
+        ref_values, ref_counts = np.unique(r[neq], return_counts=True)
+    else:
+        xor_values = np.array([], dtype=np.uint64)
+        xor_counts = np.array([], dtype=np.int64)
+        gen_values = np.array([], dtype=np.uint64)
+        gen_counts = np.array([], dtype=np.int64)
+        ref_values = np.array([], dtype=np.uint64)
+        ref_counts = np.array([], dtype=np.int64)
+
+    xor_hist = {str(int(v)): int(c) for v, c in zip(xor_values, xor_counts)}
+    generated_values = {str(int(v)): int(c) for v, c in zip(gen_values, gen_counts)}
+    reference_values = {str(int(v)): int(c) for v, c in zip(ref_values, ref_counts)}
+
+    bit_rows = []
+    for bit in range(0, 16):
+        mask = np.uint64(1 << bit)
+        changed = (xor & mask) != 0
+        count = int(np.count_nonzero(changed))
+        if count:
+            bit_rows.append({
+                "bit_index": bit,
+                "bit_value": int(1 << bit),
+                "changed_pixel_count": count,
+                "changed_pixel_fraction": float(count / total) if total else None,
+            })
+
+    xor_values_list = sorted([int(v) for v in xor_values.tolist()]) if mismatch_count else []
+    xor_only_4096 = bool(mismatch_count > 0 and xor_values_list == [4096])
+
+    return {
+        "dq_present": True,
+        "dq_shape_match": True,
+        "dq_exact": mismatch_count == 0,
+        "dq_mismatch_pixel_count": mismatch_count,
+        "dq_total_pixel_count": total,
+        "dq_mismatch_fraction": mismatch_fraction,
+        "dq_xor_values": xor_values_list,
+        "dq_xor_histogram": xor_hist,
+        "dq_xor_only_4096": xor_only_4096,
+        "generated_dq_values_on_mismatch": generated_values,
+        "reference_dq_values_on_mismatch": reference_values,
+        "dq_bitplane_rows": bit_rows,
+    }
+
+def science_overlap_audit(gen_hdul, ref_hdul, dq_mismatch_mask):
+    rows = []
+    dq_count = int(np.count_nonzero(dq_mismatch_mask)) if dq_mismatch_mask is not None else None
+
+    for ext in SCIENCE_EXTENSIONS:
+        _, _, gen_data = get_ext_data(gen_hdul, ext)
+        _, _, ref_data = get_ext_data(ref_hdul, ext)
+
+        if gen_data is None or ref_data is None or dq_mismatch_mask is None:
+            rows.append({
+                "extension": ext,
+                "science_exact": False,
+                "dq_mismatch_pixels": dq_count,
+                "science_diff_pixels_total": None,
+                "science_diff_pixels_overlap_dq_mismatch": None,
+                "overlap_fraction_of_dq_mismatch": None,
+                "overlap_fraction_of_science_diff": None,
+                "note": "missing data",
+            })
+            continue
+
+        if gen_data.shape != ref_data.shape or gen_data.shape != dq_mismatch_mask.shape:
+            rows.append({
+                "extension": ext,
+                "science_exact": False,
+                "dq_mismatch_pixels": dq_count,
+                "science_diff_pixels_total": None,
+                "science_diff_pixels_overlap_dq_mismatch": None,
+                "overlap_fraction_of_dq_mismatch": None,
+                "overlap_fraction_of_science_diff": None,
+                "note": "shape mismatch",
+            })
+            continue
+
+        if np.issubdtype(gen_data.dtype, np.floating) or np.issubdtype(ref_data.dtype, np.floating):
+            equal = (gen_data == ref_data) | (np.isnan(gen_data) & np.isnan(ref_data))
+        else:
+            equal = gen_data == ref_data
+
+        science_diff = ~equal
+        science_diff_count = int(np.count_nonzero(science_diff))
+        overlap = science_diff & dq_mismatch_mask
+        overlap_count = int(np.count_nonzero(overlap))
+
+        rows.append({
+            "extension": ext,
+            "science_exact": science_diff_count == 0,
+            "dq_mismatch_pixels": dq_count,
+            "science_diff_pixels_total": science_diff_count,
+            "science_diff_pixels_overlap_dq_mismatch": overlap_count,
+            "overlap_fraction_of_dq_mismatch": float(overlap_count / dq_count) if dq_count else 0.0,
+            "overlap_fraction_of_science_diff": float(overlap_count / science_diff_count) if science_diff_count else 0.0,
+            "note": "",
+        })
+
+    return rows
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--package-dir", required=True)
+    ap.add_argument("--generated-dir", required=True)
+    ap.add_argument("--output-dir", required=True)
+    ap.add_argument("--expected-root-count", type=int, default=20)
+    ap.add_argument("--stenv-release", default="unknown")
+    ap.add_argument("--crds-context", default="unknown")
+    args = ap.parse_args()
+
+    mkdirp(args.output_dir)
+
+    ref_map = build_reference_map(args.package_dir)
+    gen_map = build_generated_map(args.generated_dir)
+    roots = sorted(set(ref_map.keys()) | set(gen_map.keys()))
+
+    by_root_rows = []
+    by_bit_rows = []
+    overlap_rows = []
+    failures = []
+
+    extension_exact_counts = {ext: 0 for ext in ALL_EXTENSIONS}
+    dq_exact_roots = []
+    dq_mismatch_roots = []
+    dq_xor_only_4096_roots = []
+    dq_non_4096_roots = []
+    roots_with_science_overlap = []
+
+    roots_processed = 0
+
+    for root in roots:
+        ref_path = ref_map.get(root)
+        gen_path = gen_map.get(root)
+
+        if not ref_path or not gen_path:
+            failures.append({
+                "root": root,
+                "reason": "missing_reference_or_generated",
+                "reference_present": bool(ref_path),
+                "generated_present": bool(gen_path),
+            })
+            continue
+
+        roots_processed += 1
+
+        with fits.open(ref_path, memmap=False) as ref_hdul, fits.open(gen_path, memmap=False) as gen_hdul:
+            ext_stats = {}
+
+            for ext in ALL_EXTENSIONS:
+                _, _, gen_data = get_ext_data(gen_hdul, ext)
+                _, _, ref_data = get_ext_data(ref_hdul, ext)
+                stats = diff_stats(gen_data, ref_data)
+                ext_stats[ext] = stats
+                if stats.get("exact") is True:
+                    extension_exact_counts[ext] += 1
+
+            _, _, gen_dq = get_ext_data(gen_hdul, "DQ")
+            _, _, ref_dq = get_ext_data(ref_hdul, "DQ")
+            dq_stats = dq_bitplane_stats(gen_dq, ref_dq)
+
+            dq_mask = None
+            if gen_dq is not None and ref_dq is not None and gen_dq.shape == ref_dq.shape:
+                dq_mask = np.bitwise_xor(gen_dq.astype(np.uint64), ref_dq.astype(np.uint64)) != 0
+
+            root_overlap_rows = science_overlap_audit(gen_hdul, ref_hdul, dq_mask)
+            any_overlap = False
+            for row in root_overlap_rows:
+                row["root"] = root
+                overlap_rows.append(row)
+                if (row.get("science_diff_pixels_overlap_dq_mismatch") or 0) > 0:
+                    any_overlap = True
+
+            if any_overlap:
+                roots_with_science_overlap.append(root)
+
+            dq_exact = bool(dq_stats.get("dq_exact"))
+            if dq_exact:
+                dq_exact_roots.append(root)
+            else:
+                dq_mismatch_roots.append(root)
+
+            if dq_stats.get("dq_xor_only_4096"):
+                dq_xor_only_4096_roots.append(root)
+            elif not dq_exact:
+                dq_non_4096_roots.append(root)
+
+            for bit_row in dq_stats.get("dq_bitplane_rows", []):
+                br = dict(bit_row)
+                br["root"] = root
+                by_bit_rows.append(br)
+
+            row = {
+                "root": root,
+                "SCI_exact": ext_stats["SCI"].get("exact"),
+                "ERR_exact": ext_stats["ERR"].get("exact"),
+                "SAMP_exact": ext_stats["SAMP"].get("exact"),
+                "TIME_exact": ext_stats["TIME"].get("exact"),
+                "DQ_exact": dq_exact,
+                "DQ_mismatch_pixel_count": dq_stats.get("dq_mismatch_pixel_count"),
+                "DQ_total_pixel_count": dq_stats.get("dq_total_pixel_count"),
+                "DQ_mismatch_fraction": dq_stats.get("dq_mismatch_fraction"),
+                "DQ_xor_values": json.dumps(dq_stats.get("dq_xor_values", [])),
+                "DQ_xor_histogram": json.dumps(dq_stats.get("dq_xor_histogram", {}), sort_keys=True),
+                "DQ_xor_only_4096": dq_stats.get("dq_xor_only_4096"),
+                "generated_DQ_values_on_mismatch": json.dumps(dq_stats.get("generated_dq_values_on_mismatch", {}), sort_keys=True),
+                "reference_DQ_values_on_mismatch": json.dumps(dq_stats.get("reference_dq_values_on_mismatch", {}), sort_keys=True),
+                "science_diff_overlap_DQ_mismatch": any_overlap,
+                "SCI_changed_pixel_count": ext_stats["SCI"].get("changed_pixel_count"),
+                "ERR_changed_pixel_count": ext_stats["ERR"].get("changed_pixel_count"),
+                "SAMP_changed_pixel_count": ext_stats["SAMP"].get("changed_pixel_count"),
+                "TIME_changed_pixel_count": ext_stats["TIME"].get("changed_pixel_count"),
+                "DQ_changed_pixel_count": ext_stats["DQ"].get("changed_pixel_count"),
+                "DQ_max_abs_diff": ext_stats["DQ"].get("max_abs_diff"),
+                "DQ_median_abs_diff": ext_stats["DQ"].get("median_abs_diff"),
+                "DQ_p99_abs_diff": ext_stats["DQ"].get("p99_abs_diff"),
+                "DQ_rmse": ext_stats["DQ"].get("rmse"),
+                "reference_path": ref_path,
+                "generated_path": gen_path,
+            }
+            by_root_rows.append(row)
+
+    expected = args.expected_root_count
+    science_exact = all(extension_exact_counts.get(ext) == expected for ext in SCIENCE_EXTENSIONS)
+    dq_exact = extension_exact_counts.get("DQ") == expected
+
+    all_dq_mismatch_roots_xor_only_4096 = (
+        len(dq_mismatch_roots) > 0
+        and sorted(dq_mismatch_roots) == sorted(dq_xor_only_4096_roots)
+    )
+    no_science_overlap = len(roots_with_science_overlap) == 0
+
+    strict_tier1b_exact_supported = science_exact and dq_exact and roots_processed == expected and len(failures) == 0
+    strict_dq_provenance_acceptance_supported = (
+        science_exact
+        and not dq_exact
+        and roots_processed == expected
+        and len(failures) == 0
+        and all_dq_mismatch_roots_xor_only_4096
+        and no_science_overlap
+    )
+
+    if strict_tier1b_exact_supported:
+        decision = "tier1b_exact_supported"
+        decision_certificate = "dq_direct_forensics_strict_all_extension_exact_tier1b_supported"
+        claim_ceiling = "Literal Tier 1B all-extension raw-to-calibrated FLT detector replay supported."
+    elif strict_dq_provenance_acceptance_supported:
+        decision = "tier1b_provenance_candidate_supported_not_literal_dq_exact"
+        decision_certificate = "dq_direct_forensics_4096_only_no_science_overlap_tier1b_provenance_candidate_supported"
+        claim_ceiling = (
+            "Strict DQ provenance candidate supported: SCI/ERR/SAMP/TIME exact 20/20; "
+            "DQ mismatch confined to XOR=4096; no science-array overlap. Not literal DQ exact replay."
+        )
+    elif science_exact:
+        decision = "tier1a_preserved_tier1b_blocked"
+        decision_certificate = "dq_direct_forensics_tier1a_preserved_tier1b_still_blocked"
+        claim_ceiling = "Tier 1A science-array replay preserved; Tier 1B remains blocked by DQ evidence."
+    else:
+        decision = "science_array_regression_or_incomplete"
+        decision_certificate = "dq_direct_forensics_science_array_regression_or_incomplete"
+        claim_ceiling = "No Tier 1A/Tier 1B upgrade; science-array exactness failed or run incomplete."
+
+    summary = {
+        "timestamp_utc": now_utc(),
+        "expected_root_count": expected,
+        "roots_processed": roots_processed,
+        "reference_root_count": len(ref_map),
+        "generated_root_count": len(gen_map),
+        "failure_count": len(failures),
+        "failures": failures,
+        "stenv_release": args.stenv_release,
+        "crds_context": args.crds_context,
+        "extension_exact_counts": extension_exact_counts,
+        "science_exact_all_roots": science_exact,
+        "dq_exact_all_roots": dq_exact,
+        "dq_exact_roots": sorted(dq_exact_roots),
+        "dq_mismatch_roots": sorted(dq_mismatch_roots),
+        "dq_mismatch_count": len(dq_mismatch_roots),
+        "dq_xor_only_4096_roots": sorted(dq_xor_only_4096_roots),
+        "dq_non_4096_roots": sorted(dq_non_4096_roots),
+        "all_dq_mismatch_roots_xor_only_4096": all_dq_mismatch_roots_xor_only_4096,
+        "roots_with_science_overlap": sorted(roots_with_science_overlap),
+        "no_science_overlap": no_science_overlap,
+        "strict_tier1b_exact_supported": strict_tier1b_exact_supported,
+        "strict_dq_provenance_acceptance_supported": strict_dq_provenance_acceptance_supported,
+        "decision": decision,
+        "decision_certificate": decision_certificate,
+        "claim_ceiling": claim_ceiling,
+        "forbidden_claims": [
+            "full public dark-matter closure from this run alone",
+            "raw-to-drizzled HLSP reconstruction",
+            "field acceptance",
+            "semantic evidence as closure evidence",
+        ],
+    }
+
+    claim_decision = {
+        "timestamp_utc": now_utc(),
+        "decision": decision,
+        "decision_certificate": decision_certificate,
+        "claim_ceiling": claim_ceiling,
+        "tier1a_science_array_replay_supported": science_exact,
+        "tier1b_literal_all_extension_replay_supported": strict_tier1b_exact_supported,
+        "dq_provenance_contract_candidate_supported": strict_dq_provenance_acceptance_supported,
+        "extension_exact_counts": extension_exact_counts,
+        "dq_mismatch_roots": sorted(dq_mismatch_roots),
+        "dq_xor_only_4096_roots": sorted(dq_xor_only_4096_roots),
+        "dq_non_4096_roots": sorted(dq_non_4096_roots),
+        "roots_with_science_overlap": sorted(roots_with_science_overlap),
+    }
+
+    write_json(os.path.join(args.output_dir, "dq_bitplane_forensics_summary.json"), summary)
+    write_json(os.path.join(args.output_dir, "claim_decision.json"), claim_decision)
+
+    write_csv(
+        os.path.join(args.output_dir, "dq_bitplane_forensics_by_root.csv"),
+        by_root_rows,
+        [
+            "root",
+            "SCI_exact",
+            "ERR_exact",
+            "SAMP_exact",
+            "TIME_exact",
+            "DQ_exact",
+            "DQ_mismatch_pixel_count",
+            "DQ_total_pixel_count",
+            "DQ_mismatch_fraction",
+            "DQ_xor_values",
+            "DQ_xor_histogram",
+            "DQ_xor_only_4096",
+            "generated_DQ_values_on_mismatch",
+            "reference_DQ_values_on_mismatch",
+            "science_diff_overlap_DQ_mismatch",
+            "SCI_changed_pixel_count",
+            "ERR_changed_pixel_count",
+            "SAMP_changed_pixel_count",
+            "TIME_changed_pixel_count",
+            "DQ_changed_pixel_count",
+            "DQ_max_abs_diff",
+            "DQ_median_abs_diff",
+            "DQ_p99_abs_diff",
+            "DQ_rmse",
+            "reference_path",
+            "generated_path",
+        ],
+    )
+
+    write_csv(
+        os.path.join(args.output_dir, "dq_bitplane_forensics_by_bit.csv"),
+        by_bit_rows,
+        ["root", "bit_index", "bit_value", "changed_pixel_count", "changed_pixel_fraction"],
+    )
+
+    write_csv(
+        os.path.join(args.output_dir, "science_overlap_audit.csv"),
+        overlap_rows,
+        [
+            "root",
+            "extension",
+            "science_exact",
+            "dq_mismatch_pixels",
+            "science_diff_pixels_total",
+            "science_diff_pixels_overlap_dq_mismatch",
+            "overlap_fraction_of_dq_mismatch",
+            "overlap_fraction_of_science_diff",
+            "note",
+        ],
+    )
+
+    print(json.dumps(summary, indent=2, sort_keys=True))
+
+    if decision in ["tier1b_exact_supported", "tier1b_provenance_candidate_supported_not_literal_dq_exact"]:
+        return 0
+    if decision == "tier1a_preserved_tier1b_blocked":
+        return 3
+    return 4
+
+if __name__ == "__main__":
+    sys.exit(main())
+          PY
+
+      - name: Run direct DQ bitplane forensics
+        shell: bash -l {0}
+        continue-on-error: true
+        env:
+          STENV_RELEASE: "2026.04.14"
+          CRDS_SERVER_URL: https://hst-crds.stsci.edu
+          CRDS_PATH: ${{ github.workspace }}/crds_cache
+          CRDS_CONTEXT: ${{ github.event.inputs.crds_context }}
+          iref: ${{ github.workspace }}/crds_cache/references/hst/wfc3/
+        run: |
+          set -euo pipefail
+
+          WORK_ROOT="ti_hstcal_dq_direct_work"
+          RAW_PACKAGE_ZIP="TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip"
+
+          rm -rf "${WORK_ROOT}"
+          mkdir -p "${WORK_ROOT}"
+
+          EXTRACT_ROOT="${WORK_ROOT}/package_extract"
+          unzip -q "${RAW_PACKAGE_ZIP}" -d "${EXTRACT_ROOT}"
+
+          RESULTS_DIR="${WORK_ROOT}/results"
+          GENERATED_DIR="${RESULTS_DIR}/generated"
+          LOG_DIR="${RESULTS_DIR}/logs"
+          NORMALIZED_DIR="${RESULTS_DIR}/normalized_package"
+          NORMALIZED_RAW_DIR="${NORMALIZED_DIR}/data/raw"
+          NORMALIZED_CAL_DIR="${NORMALIZED_DIR}/data/calibrated_reference"
+
+          mkdir -p "${RESULTS_DIR}" "${GENERATED_DIR}" "${LOG_DIR}" "${NORMALIZED_RAW_DIR}" "${NORMALIZED_CAL_DIR}"
+
+          MASTER_LOG="${LOG_DIR}/dq_direct_calwf3_command_log.txt"
+
+          {
+            echo "TI Paper II direct DQ bitplane forensics run"
+            echo "Timestamp UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Normalizing from entire extracted ZIP, not first package folder..."
+
+            find "${EXTRACT_ROOT}" -type f \( -name '*_raw.fits' -o -name '*_raw.fits.gz' \) -print0 | while IFS= read -r -d '' RAW_FILE; do
+              cp -p "${RAW_FILE}" "${NORMALIZED_RAW_DIR}/$(basename "${RAW_FILE}")"
+            done
+
+            find "${EXTRACT_ROOT}" -type f \( -name '*_flt.fits' -o -name '*_flc.fits' \) -print0 | while IFS= read -r -d '' CAL_FILE; do
+              cp -p "${CAL_FILE}" "${NORMALIZED_CAL_DIR}/$(basename "${CAL_FILE}")"
+            done
+
+            RAW_COUNT="$(find "${NORMALIZED_RAW_DIR}" -maxdepth 1 -type f -name '*_raw.fits*' | wc -l | tr -d ' ')"
+            CAL_COUNT="$(find "${NORMALIZED_CAL_DIR}" -maxdepth 1 -type f \( -name '*_flt.fits*' -o -name '*_flc.fits*' \) | wc -l | tr -d ' ')"
+
+            echo "Normalized raw count: ${RAW_COUNT}"
+            echo "Normalized calibrated reference count: ${CAL_COUNT}"
+
+            CAL_EXE=""
+            if command -v calwf3.e >/dev/null 2>&1; then
+              CAL_EXE="calwf3.e"
+            elif command -v calwf3 >/dev/null 2>&1; then
+              CAL_EXE="calwf3"
+            else
+              echo "No calwf3 executable found."
+              exit 2
+            fi
+
+            export CRDS_SERVER_URL="${CRDS_SERVER_URL:-https://hst-crds.stsci.edu}"
+            export CRDS_PATH="${CRDS_PATH:-${PWD}/crds_cache}"
+            export CRDS_CONTEXT="${CRDS_CONTEXT:-hst_1313.pmap}"
+
+            IREF_CANDIDATES=(
+              "${CRDS_PATH}/references/hst/wfc3/"
+              "${CRDS_PATH}/references/hst/iref/"
+            )
+
+            shopt -s nullglob
+            RAW_FILES=( "${NORMALIZED_RAW_DIR}"/*_raw.fits "${NORMALIZED_RAW_DIR}"/*_raw.fits.gz )
+
+            for RAW in "${RAW_FILES[@]}"; do
+              BASE="$(basename "${RAW}")"
+              ROOT="${BASE%%_raw.fits}"
+              ROOT="${ROOT%%_raw.fits.gz}"
+
+              ROOT_RESULT_DIR="${GENERATED_DIR}/${ROOT}"
+              mkdir -p "${ROOT_RESULT_DIR}"
+              ROOT_RESULT_DIR_ABS="$(cd "${ROOT_RESULT_DIR}" && pwd -P)"
+
+              SUCCESS=0
+
+              for IREF_VALUE in "${IREF_CANDIDATES[@]}"; do
+                if [[ "${SUCCESS}" -eq 1 ]]; then break; fi
+                export iref="${IREF_VALUE}"
+                mkdir -p "${iref}"
+
+                WORK_DIR="${ROOT_RESULT_DIR}/bestrefs_context_plain_${CAL_EXE//./_}"
+                rm -rf "${WORK_DIR}"
+                mkdir -p "${WORK_DIR}"
+                WORK_DIR_ABS="$(cd "${WORK_DIR}" && pwd -P)"
+                cp -p "${RAW}" "${WORK_DIR_ABS}/${ROOT}_raw.fits"
+
+                pushd "${WORK_DIR_ABS}" >/dev/null
+
+                echo "Running CRDS bestrefs for ${ROOT} with ${CRDS_CONTEXT}, iref=${iref}, exe=${CAL_EXE}"
+                crds bestrefs --files "${ROOT}_raw.fits" --new-context "${CRDS_CONTEXT}" --sync-references=1 --update-bestrefs || true
+
+                set +e
+                "${CAL_EXE}" "${ROOT}_raw.fits"
+                STATUS=$?
+                set -e
+
+                echo "calwf3 status for ${ROOT}: ${STATUS}"
+
+                FOUND_OUTPUT=""
+                for CAND in "${ROOT}_flt.fits" "${ROOT}_flc.fits" *_flt.fits *_flc.fits; do
+                  if [[ -f "${CAND}" ]]; then
+                    FOUND_OUTPUT="$(pwd -P)/${CAND}"
+                    break
+                  fi
+                done
+
+                if [[ -n "${FOUND_OUTPUT}" && -f "${FOUND_OUTPUT}" ]]; then
+                  cp -p "${FOUND_OUTPUT}" "${ROOT_RESULT_DIR_ABS}/$(basename "${FOUND_OUTPUT}")"
+                  echo "bestrefs_context_plain" > "${ROOT_RESULT_DIR_ABS}/winning_mode.txt"
+                  echo "${CAL_EXE}" > "${ROOT_RESULT_DIR_ABS}/winning_executable.txt"
+                  echo "${iref}" > "${ROOT_RESULT_DIR_ABS}/winning_iref.txt"
+                  SUCCESS=1
+                fi
+
+                popd >/dev/null
+              done
+
+              if [[ "${SUCCESS}" -ne 1 ]]; then
+                echo "No generated FLT/FLC output for ${ROOT}"
+              fi
+            done
+
+            python ti_direct_scripts/dq_direct_forensics.py \
+              --package-dir "${NORMALIZED_DIR}" \
+              --generated-dir "${GENERATED_DIR}" \
+              --output-dir "${RESULTS_DIR}" \
+              --expected-root-count 20 \
+              --stenv-release "${STENV_RELEASE}" \
+              --crds-context "${CRDS_CONTEXT}"
+
+          } 2>&1 | tee "${MASTER_LOG}"
+
+      - name: Upload compact direct DQ artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ti-paperii-hstcal-dq-direct-forensics-results
+          path: |
+            raw_package.sha256
+            ti_hstcal_dq_direct_work/results/dq_bitplane_forensics_summary.json
+            ti_hstcal_dq_direct_work/results/dq_bitplane_forensics_by_root.csv
+            ti_hstcal_dq_direct_work/results/dq_bitplane_forensics_by_bit.csv
+            ti_hstcal_dq_direct_work/results/science_overlap_audit.csv
+            ti_hstcal_dq_direct_work/results/claim_decision.json
+            ti_hstcal_dq_direct_work/results/logs/**
+            ti_hstcal_dq_direct_work/results/generated/**/winning_mode.txt
+            ti_hstcal_dq_direct_work/results/generated/**/winning_executable.txt
+            ti_hstcal_dq_direct_work/results/generated/**/winning_iref.txt
+          if-no-files-found: warn
