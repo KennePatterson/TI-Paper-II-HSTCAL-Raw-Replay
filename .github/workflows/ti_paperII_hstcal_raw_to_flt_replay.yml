@@ -11,17 +11,17 @@ on:
       stenv_yaml_url:
         description: "Official stenv Linux X64 release YAML URL"
         required: false
-        default: "https://github.com/spacetelescope/stenv/releases/download/2026.04.14/stenv-Linux-X64-py3.12-2026.04.14.yaml"
+        default: "https://github.com/spacetelescope/stenv/releases/download/2026.04.14/stenv-Linux-X64-py3.13-2026.04.14.yaml"
         type: string
       stenv_yaml_sha256:
         description: "Expected SHA256 for stenv release YAML"
         required: false
-        default: "ba6e3d0d555b5a747c6f4cf1a2064d519afcf2cfa24d29bee278822c7807f626"
+        default: "2f967290c3c9fe2a4b3911022a737d91cea72f52f0115ecacb4b1d355ad82cb8"
         type: string
       stenv_yaml_filename:
         description: "stenv release YAML filename"
         required: false
-        default: "stenv-Linux-X64-py3.12-2026.04.14.yaml"
+        default: "stenv-Linux-X64-py3.13-2026.04.14.yaml"
         type: string
       crds_context:
         description: "CRDS_CONTEXT. Default is package/reference context hst_1313.pmap."
@@ -37,6 +37,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install diagnostics tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gdb file binutils || true
 
       - name: Install micromamba
         uses: mamba-org/setup-micromamba@v3
@@ -61,15 +67,16 @@ jobs:
           micromamba run -n stenv-ti python -V
           micromamba run -n stenv-ti bash -lc 'which calwf3.e || which calwf3'
           micromamba run -n stenv-ti bash -lc 'which crds || true'
+          micromamba run -n stenv-ti bash -lc 'ldd $(which calwf3.e || which calwf3) || true'
           micromamba run -n stenv-ti python - <<'PY'
-          import crds
-          print("crds", getattr(crds, "__version__", "unknown"))
-          try:
-              import drizzlepac
-              print("drizzlepac", getattr(drizzlepac, "__version__", "unknown"))
-          except Exception as exc:
-              print("drizzlepac_import_error", repr(exc))
-          PY
+import crds
+print("crds", getattr(crds, "__version__", "unknown"))
+try:
+    import drizzlepac
+    print("drizzlepac", getattr(drizzlepac, "__version__", "unknown"))
+except Exception as exc:
+    print("drizzlepac_import_error", repr(exc))
+PY
 
       - name: Download true-science raw package
         shell: bash
@@ -79,7 +86,7 @@ jobs:
           sha256sum TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip | tee raw_package.sha256
           echo "fa792f077f14a35756f10bfafd8401ca3e8e43dbd83e9f485b7077acb543de30  TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip" | sha256sum -c -
 
-      - name: Run HSTCAL raw-to-FLT/FLC replay
+      - name: Run HSTCAL crash-forensics replay
         shell: bash -l {0}
         continue-on-error: true
         env:
@@ -89,7 +96,7 @@ jobs:
           CRDS_SERVER_URL: https://hst-crds.stsci.edu
           CRDS_PATH: ${{ github.workspace }}/crds_cache
           CRDS_CONTEXT: ${{ github.event.inputs.crds_context }}
-          iref: ${{ github.workspace }}/crds_cache/references/hst/iref/
+          iref: ${{ github.workspace }}/crds_cache/references/hst/wfc3/
         run: |
           set -euo pipefail
           micromamba run -n stenv-ti bash scripts/run_hstcal_replay.sh TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip ti_hstcal_replay_work
