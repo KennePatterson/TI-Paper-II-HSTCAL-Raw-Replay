@@ -1,0 +1,282 @@
+name: TI Paper II HSTCAL DQ Literal Exactness Attack Repaired
+
+on:
+
+  workflow_dispatch:
+
+    inputs:
+
+      raw_package_url:
+
+        description: "URL to true-science raw package"
+
+        required: false
+
+        default: "https://github.com/KennePatterson/TI-Paper-II-HSTCAL-Raw-Replay/releases/download/v0.1-raw-package/TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip"
+
+        type: string
+
+      raw_package_sha256:
+
+        description: "Expected SHA256 for true-science raw package"
+
+        required: false
+
+        default: "fa792f077f14a35756f10bfafd8401ca3e8e43dbd83e9f485b7077acb543de30"
+
+        type: string
+
+      stenv_yaml_url:
+
+        description: "Official stenv Linux X64 release YAML URL"
+
+        required: false
+
+        default: "https://github.com/spacetelescope/stenv/releases/download/2026.04.14/stenv-Linux-X64-py3.13-2026.04.14.yaml"
+
+        type: string
+
+      stenv_yaml_sha256:
+
+        description: "Expected SHA256 for stenv release YAML"
+
+        required: false
+
+        default: "2f967290c3c9fe2a4b3911022a737d91cea72f52f0115ecacb4b1d355ad82cb8"
+
+        type: string
+
+      stenv_yaml_filename:
+
+        description: "stenv release YAML filename"
+
+        required: false
+
+        default: "stenv-Linux-X64-py3.13-2026.04.14.yaml"
+
+        type: string
+
+      crds_context:
+
+        description: "CRDS_CONTEXT"
+
+        required: false
+
+        default: "hst_1313.pmap"
+
+        type: string
+
+jobs:
+
+  dq-literal-exactness-attack-repaired:
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 120
+
+    steps:
+
+      - name: Checkout
+
+        uses: actions/checkout@v4
+
+      - name: Install diagnostics tools
+
+        shell: bash
+
+        run: |
+
+          sudo apt-get update
+
+          sudo apt-get install -y gdb file binutils unzip || true
+
+      - name: Install micromamba
+
+        uses: mamba-org/setup-micromamba@v3
+
+        with:
+
+          init-shell: bash
+
+          cache-environment: false
+
+          post-cleanup: all
+
+      - name: Fetch stenv release YAML
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          curl -L "${{ github.event.inputs.stenv_yaml_url }}" -o "${{ github.event.inputs.stenv_yaml_filename }}"
+
+          echo "${{ github.event.inputs.stenv_yaml_sha256 }}  ${{ github.event.inputs.stenv_yaml_filename }}" | sha256sum -c -
+
+      - name: Create official stenv environment
+
+        shell: bash -l {0}
+
+        run: |
+
+          set -euo pipefail
+
+          micromamba env create --name stenv-ti --file "${{ github.event.inputs.stenv_yaml_filename }}" --use-uv
+
+          micromamba run -n stenv-ti python -V
+
+          micromamba run -n stenv-ti bash -lc 'which calwf3.e || which calwf3'
+
+          micromamba run -n stenv-ti python -c "import astropy, numpy, crds; print('astropy', astropy.__version__); print('numpy', numpy.__version__); print('crds', getattr(crds, '__version__', 'unknown'))"
+
+          micromamba run -n stenv-ti python -c "import drizzlepac; print('drizzlepac', getattr(drizzlepac, '__version__', 'unknown'))" || true
+
+      - name: Download true-science raw package
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          curl -L "${{ github.event.inputs.raw_package_url }}" -o TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip
+
+          sha256sum TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip | tee raw_package.sha256
+
+          echo "${{ github.event.inputs.raw_package_sha256 }}  TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip" | sha256sum -c -
+
+      - name: Run baseline raw-to-FLT replay
+
+        shell: bash -l {0}
+
+        continue-on-error: true
+
+        env:
+
+          STENV_RELEASE: "2026.04.14"
+
+          STENV_YAML_FILENAME: ${{ github.event.inputs.stenv_yaml_filename }}
+
+          STENV_YAML_SHA256: ${{ github.event.inputs.stenv_yaml_sha256 }}
+
+          CRDS_SERVER_URL: https://hst-crds.stsci.edu
+
+          CRDS_PATH: ${{ github.workspace }}/crds_cache
+
+          CRDS_CONTEXT: ${{ github.event.inputs.crds_context }}
+
+          iref: ${{ github.workspace }}/crds_cache/references/hst/wfc3/
+
+        run: |
+
+          set +e
+
+          micromamba run -n stenv-ti bash scripts/run_hstcal_replay.sh TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip ti_hstcal_replay_work
+
+          echo "$?" > baseline_replay_status.txt
+
+          set -e
+
+          cat baseline_replay_status.txt
+
+      - name: Run repaired DQ exactness adjudicator
+
+        shell: bash -l {0}
+
+        continue-on-error: true
+
+        env:
+
+          STENV_RELEASE: "2026.04.14"
+
+          CRDS_CONTEXT: ${{ github.event.inputs.crds_context }}
+
+        run: |
+
+          set +e
+
+          mkdir -p ti_hstcal_dq_exactness_repaired/results/logs
+
+          micromamba run -n stenv-ti python scripts/dq_exactness_repaired.py \
+
+            --package-dir ti_hstcal_replay_work/results/normalized_package \
+
+            --generated-dir ti_hstcal_replay_work/results/generated \
+
+            --validation-report ti_hstcal_replay_work/results/validation_report.json \
+
+            --output-dir ti_hstcal_dq_exactness_repaired/results \
+
+            --expected-root-count 20 \
+
+            --stenv-release "${STENV_RELEASE}" \
+
+            --crds-context "${CRDS_CONTEXT}" \
+
+            2>&1 | tee ti_hstcal_dq_exactness_repaired/results/logs/dq_exactness_repaired.log
+
+          echo "$?" > dq_exactness_repaired_status.txt
+
+          set -e
+
+          cat dq_exactness_repaired_status.txt
+
+      - name: Assert repaired artifact integrity
+
+        shell: bash -l {0}
+
+        continue-on-error: true
+
+        run: |
+
+          set +e
+
+          python scripts/assert_dq_exactness_artifacts.py \
+
+            --results-dir ti_hstcal_dq_exactness_repaired/results \
+
+            --output-json ti_hstcal_dq_exactness_repaired/results/artifact_integrity_report.json \
+
+            2>&1 | tee ti_hstcal_dq_exactness_repaired/results/logs/artifact_integrity_assertion.log
+
+          echo "$?" > artifact_integrity_status.txt
+
+          set -e
+
+          cat artifact_integrity_status.txt
+
+      - name: Upload repaired DQ exactness artifacts
+
+        if: always()
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: ti-paperii-hstcal-dq-literal-exactness-attack-repaired-results
+
+          path: |
+
+            raw_package.sha256
+
+            baseline_replay_status.txt
+
+            dq_exactness_repaired_status.txt
+
+            artifact_integrity_status.txt
+
+            ti_hstcal_replay_work/results/validation_report.json
+
+            ti_hstcal_replay_work/results/logs/**
+
+            ti_hstcal_replay_work/results/generated/**/winning_mode.txt
+
+            ti_hstcal_replay_work/results/generated/**/winning_executable.txt
+
+            ti_hstcal_replay_work/results/generated/**/winning_iref.txt
+
+            ti_hstcal_dq_exactness_repaired/results/**
+
+          if-no-files-found: warn
+
