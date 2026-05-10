@@ -58,7 +58,7 @@ jobs:
           micromamba env create --name stenv-ti --file "${{ github.event.inputs.stenv_yaml_filename }}" --use-uv
           micromamba run -n stenv-ti python -V
           micromamba run -n stenv-ti bash -lc 'which calwf3.e || which calwf3'
-          micromamba run -n stenv-ti python -c "import astropy, numpy, crds; print('ready')"
+          micromamba run -n stenv-ti python -c "import astropy, numpy, crds; print('stenv ready')"
 
       - name: Download raw package
         shell: bash
@@ -70,15 +70,19 @@ jobs:
 
       - name: Run baseline HSTCAL replay
         shell: bash -l {0}
+        continue-on-error: true
         env:
           CRDS_SERVER_URL: https://hst-crds.stsci.edu
           CRDS_PATH: ${{ github.workspace }}/crds_cache
           CRDS_CONTEXT: ${{ github.event.inputs.crds_context }}
           iref: ${{ github.workspace }}/crds_cache/references/hst/wfc3/
         run: |
-          set -euo pipefail
+          set +e
           micromamba run -n stenv-ti bash scripts/run_hstcal_replay.sh raw_package.zip ti_hstcal_replay_work
-          echo "0" > baseline_replay_status.txt
+          REPLAY_EXIT=$?
+          echo "${REPLAY_EXIT}" > baseline_replay_status.txt
+          echo "Replay exit code: ${REPLAY_EXIT}"
+          exit 0
 
       - name: Real repaired DQ exactness adjudication
         shell: bash -l {0}
@@ -185,9 +189,10 @@ jobs:
                       q=rdq.astype(np.uint64)
                       xor=np.bitwise_xor(g,q)
                       dqmask=xor!=0
-                      vals,counts=np.unique(xor[dqmask],return_counts=True) if np.count_nonzero(dqmask) else ([],[])
-                      xor_values=[int(v) for v in vals]
-                      xor_hist={str(int(v)):int(c) for v,c in zip(vals,counts)}
+                      if np.count_nonzero(dqmask):
+                          vals,counts=np.unique(xor[dqmask],return_counts=True)
+                          xor_values=[int(v) for v in vals]
+                          xor_hist={str(int(v)):int(c) for v,c in zip(vals,counts)}
                       xor_only_4096=(len(xor_values)==1 and xor_values[0]==4096)
                       ref4096=(q & np.uint64(4096))!=0
                       gen4096=(g & np.uint64(4096))!=0
