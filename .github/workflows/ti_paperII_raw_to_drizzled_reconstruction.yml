@@ -1,0 +1,628 @@
+name: TI Paper II Raw-to-Drizzled HLSP Reconstruction
+
+on:
+
+  workflow_dispatch:
+
+    inputs:
+
+      raw_package_url:
+
+        required: false
+
+        default: "https://github.com/KennePatterson/TI-Paper-II-HSTCAL-Raw-Replay/releases/download/v0.1-raw-package/TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip"
+
+        type: string
+
+      raw_package_sha256:
+
+        required: false
+
+        default: "fa792f077f14a35756f10bfafd8401ca3e8e43dbd83e9f485b7077acb543de30"
+
+        type: string
+
+      hlsp_reference_url:
+
+        description: "Public HLSP drizzled reference product URL. Leave blank only for admissibility/no-target artifact."
+
+        required: false
+
+        default: ""
+
+        type: string
+
+      stenv_yaml_url:
+
+        required: false
+
+        default: "https://github.com/spacetelescope/stenv/releases/download/2026.04.14/stenv-Linux-X64-py3.13-2026.04.14.yaml"
+
+        type: string
+
+      stenv_yaml_sha256:
+
+        required: false
+
+        default: "2f967290c3c9fe2a4b3911022a737d91cea72f52f0115ecacb4b1d355ad82cb8"
+
+        type: string
+
+      stenv_yaml_filename:
+
+        required: false
+
+        default: "stenv-Linux-X64-py3.13-2026.04.14.yaml"
+
+        type: string
+
+      crds_context:
+
+        required: false
+
+        default: "hst_1313.pmap"
+
+        type: string
+
+jobs:
+
+  raw_to_drizzled:
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 240
+
+    steps:
+
+      - name: Checkout repo
+
+        uses: actions/checkout@v4
+
+      - name: Install system packages
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y curl unzip file
+
+      - name: Install micromamba
+
+        uses: mamba-org/setup-micromamba@v3
+
+        with:
+
+          init-shell: bash
+
+          cache-environment: false
+
+          post-cleanup: all
+
+      - name: Fetch stenv YAML
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          curl -L "${{ github.event.inputs.stenv_yaml_url }}" -o "${{ github.event.inputs.stenv_yaml_filename }}"
+
+          echo "${{ github.event.inputs.stenv_yaml_sha256 }}  ${{ github.event.inputs.stenv_yaml_filename }}" | sha256sum -c -
+
+      - name: Create stenv
+
+        shell: bash -l {0}
+
+        run: |
+
+          set -euo pipefail
+
+          micromamba env create --name stenv-ti --file "${{ github.event.inputs.stenv_yaml_filename }}" --use-uv
+
+          micromamba run -n stenv-ti python -V
+
+          micromamba run -n stenv-ti python -c "import astropy, numpy, crds; print('stenv ready')"
+
+          micromamba run -n stenv-ti python -c "import drizzlepac; print('drizzlepac ready')" || true
+
+      - name: Download raw package
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          mkdir -p ti_raw_to_drizzled_work/inputs ti_raw_to_drizzled_work/results/logs
+
+          curl -L "${{ github.event.inputs.raw_package_url }}" -o ti_raw_to_drizzled_work/inputs/raw_package.zip
+
+          sha256sum ti_raw_to_drizzled_work/inputs/raw_package.zip | tee ti_raw_to_drizzled_work/results/raw_package.sha256
+
+          echo "${{ github.event.inputs.raw_package_sha256 }}  ti_raw_to_drizzled_work/inputs/raw_package.zip" | sha256sum -c -
+
+      - name: Download HLSP reference if provided
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          mkdir -p ti_raw_to_drizzled_work/inputs/hlsp_reference
+
+          if [ -n "${{ github.event.inputs.hlsp_reference_url }}" ]; then
+
+            curl -L "${{ github.event.inputs.hlsp_reference_url }}" -o ti_raw_to_drizzled_work/inputs/hlsp_reference/hlsp_reference.fits
+
+            sha256sum ti_raw_to_drizzled_work/inputs/hlsp_reference/hlsp_reference.fits | tee ti_raw_to_drizzled_work/results/hlsp_reference.sha256
+
+          else
+
+            echo "NO_HLSP_REFERENCE_URL_PROVIDED" | tee ti_raw_to_drizzled_work/results/hlsp_reference_status.txt
+
+          fi
+
+      - name: Run baseline HSTCAL replay to produce FLTs
+
+        shell: bash -l {0}
+
+        continue-on-error: true
+
+        env:
+
+          CRDS_SERVER_URL: https://hst-crds.stsci.edu
+
+          CRDS_PATH: ${{ github.workspace }}/crds_cache
+
+          CRDS_CONTEXT: ${{ github.event.inputs.crds_context }}
+
+          iref: ${{ github.workspace }}/crds_cache/references/hst/wfc3/
+
+        run: |
+
+          set +e
+
+          micromamba run -n stenv-ti bash scripts/run_hstcal_replay.sh ti_raw_to_drizzled_work/inputs/raw_package.zip ti_hstcal_replay_work
+
+          REPLAY_EXIT=$?
+
+          echo "${REPLAY_EXIT}" > ti_raw_to_drizzled_work/results/baseline_replay_status.txt
+
+          echo "Replay exit code: ${REPLAY_EXIT}"
+
+          exit 0
+
+      - name: Raw-to-drizzled admissibility and bounded attempt
+
+        shell: bash -l {0}
+
+        env:
+
+          CRDS_CONTEXT: ${{ github.event.inputs.crds_context }}
+
+          HLSP_REFERENCE_URL: ${{ github.event.inputs.hlsp_reference_url }}
+
+        run: |
+
+          cat > raw_to_drizzled_runner.py <<'PY'
+
+          import os, re, csv, json, subprocess, math
+
+          from datetime import datetime, timezone
+
+          import numpy as np
+
+          from astropy.io import fits
+
+          OUT = "ti_raw_to_drizzled_work/results"
+
+          LOGS = os.path.join(OUT, "logs")
+
+          os.makedirs(OUT, exist_ok=True)
+
+          os.makedirs(LOGS, exist_ok=True)
+
+          def now():
+
+              return datetime.now(timezone.utc).isoformat()
+
+          def write_json(name, obj):
+
+              with open(os.path.join(OUT, name), "w", encoding="utf-8") as f:
+
+                  json.dump(obj, f, indent=2, sort_keys=True)
+
+          def write_csv(name, rows, cols):
+
+              with open(os.path.join(OUT, name), "w", newline="", encoding="utf-8") as f:
+
+                  w = csv.DictWriter(f, fieldnames=cols)
+
+                  w.writeheader()
+
+                  for r in rows:
+
+                      w.writerow({c: r.get(c, "") for c in cols})
+
+          def collect_flts(base):
+
+              out = []
+
+              if os.path.exists(base):
+
+                  for dp, _, fs in os.walk(base):
+
+                      for fn in fs:
+
+                          if fn.lower().endswith(("_flt.fits","_flc.fits")):
+
+                              out.append(os.path.join(dp, fn))
+
+              return sorted(out)
+
+          def image_data(path):
+
+              with fits.open(path, memmap=False) as h:
+
+                  for ext in ["SCI", "PRIMARY"]:
+
+                      if ext == "PRIMARY":
+
+                          data = h[0].data
+
+                      else:
+
+                          data = None
+
+                          for hh in h:
+
+                              if str(hh.header.get("EXTNAME","")).upper().strip() == "SCI" and hh.data is not None:
+
+                                  data = hh.data
+
+                                  break
+
+                      if data is not None:
+
+                          return np.asarray(data, dtype=float)
+
+              return None
+
+          def metrics(a, b):
+
+              if a is None or b is None:
+
+                  return {"comparable": False, "reason": "missing_array"}
+
+              if a.shape != b.shape:
+
+                  return {"comparable": False, "reason": "shape_mismatch", "generated_shape": list(a.shape), "reference_shape": list(b.shape)}
+
+              aa = a.ravel()
+
+              bb = b.ravel()
+
+              mask = np.isfinite(aa) & np.isfinite(bb)
+
+              if not np.any(mask):
+
+                  return {"comparable": False, "reason": "no_finite_overlap"}
+
+              aa = aa[mask]
+
+              bb = bb[mask]
+
+              diff = aa - bb
+
+              denom = float(np.sqrt(np.mean(bb*bb))) if bb.size else 0.0
+
+              nrmse = float(np.sqrt(np.mean(diff*diff)) / denom) if denom else None
+
+              dot = float(np.dot(aa, bb))
+
+              na = float(np.linalg.norm(aa))
+
+              nb = float(np.linalg.norm(bb))
+
+              cosine = float(dot / (na * nb)) if na and nb else None
+
+              sign_agreement = float(np.mean(np.sign(aa) == np.sign(bb)))
+
+              return {
+
+                  "comparable": True,
+
+                  "finite_pixel_count": int(aa.size),
+
+                  "generated_mean": float(np.mean(aa)),
+
+                  "reference_mean": float(np.mean(bb)),
+
+                  "mean_abs_diff": float(np.mean(np.abs(diff))),
+
+                  "max_abs_diff": float(np.max(np.abs(diff))),
+
+                  "normalized_rmse": nrmse,
+
+                  "cosine": cosine,
+
+                  "sign_agreement": sign_agreement,
+
+              }
+
+          hlsp_ref = "ti_raw_to_drizzled_work/inputs/hlsp_reference/hlsp_reference.fits"
+
+          hlsp_present = os.path.exists(hlsp_ref)
+
+          generated_flts = collect_flts("ti_hstcal_replay_work/results/generated")
+
+          reference_flts = collect_flts("ti_hstcal_replay_work/results/normalized_package/data/calibrated_reference")
+
+          input_ledger = {
+
+              "timestamp_utc": now(),
+
+              "hlsp_reference_url": os.environ.get("HLSP_REFERENCE_URL",""),
+
+              "hlsp_reference_present": hlsp_present,
+
+              "generated_flt_count": len(generated_flts),
+
+              "reference_flt_count": len(reference_flts),
+
+              "generated_flt_sample": generated_flts[:10],
+
+              "reference_flt_sample": reference_flts[:10],
+
+          }
+
+          write_json("input_provenance_ledger.json", input_ledger)
+
+          # Conservative first attempt:
+
+          # If HLSP target is missing, emit blocker.
+
+          # If target exists, compare reference target with a simple median-combined proxy product.
+
+          # This is not full AstroDrizzle closure; it is a first bounded admissibility/product test.
+
+          product_path = os.path.join(OUT, "bounded_generated_proxy_drizzle.fits")
+
+          attempt_log = []
+
+          decision = None
+
+          decision_cert = None
+
+          comparison = {}
+
+          if not hlsp_present:
+
+              decision = "raw_to_drizzled_blocked_by_missing_public_hlsp_reference"
+
+              decision_cert = "raw_to_drizzled_missing_hlsp_reference_url"
+
+              attempt_log.append("No HLSP reference URL provided; cannot perform numeric raw-to-drizzled comparison.")
+
+          elif len(generated_flts) == 0:
+
+              decision = "raw_to_drizzled_blocked_by_missing_generated_flts"
+
+              decision_cert = "raw_to_drizzled_missing_generated_flt_products"
+
+              attempt_log.append("No generated FLT/FLC products found after baseline replay.")
+
+          else:
+
+              arrays = []
+
+              shapes = {}
+
+              for p in generated_flts:
+
+                  try:
+
+                      arr = image_data(p)
+
+                      if arr is not None:
+
+                          shapes.setdefault(str(arr.shape), 0)
+
+                          shapes[str(arr.shape)] += 1
+
+                          arrays.append(arr)
+
+                  except Exception as e:
+
+                      attempt_log.append(f"read failed {p}: {e!r}")
+
+              if not arrays:
+
+                  decision = "raw_to_drizzled_blocked_by_unreadable_generated_flts"
+
+                  decision_cert = "raw_to_drizzled_unreadable_generated_flt_products"
+
+              else:
+
+                  # Use most common shape for bounded proxy.
+
+                  shape_counts = {}
+
+                  for a in arrays:
+
+                      shape_counts[a.shape] = shape_counts.get(a.shape, 0) + 1
+
+                  common_shape = sorted(shape_counts.items(), key=lambda x: x[1], reverse=True)[0][0]
+
+                  stack = np.stack([a for a in arrays if a.shape == common_shape], axis=0)
+
+                  proxy = np.nanmedian(stack, axis=0)
+
+                  fits.PrimaryHDU(proxy).writeto(product_path, overwrite=True)
+
+                  ref_arr = image_data(hlsp_ref)
+
+                  comparison = metrics(proxy, ref_arr)
+
+                  comparison["generated_product"] = product_path
+
+                  comparison["hlsp_reference"] = hlsp_ref
+
+                  comparison["generated_proxy_shape"] = list(proxy.shape)
+
+                  comparison["input_shape_counts"] = {str(k): int(v) for k,v in shape_counts.items()}
+
+                  if comparison.get("comparable") and comparison.get("cosine") is not None:
+
+                      if comparison["cosine"] >= 0.999 and (comparison.get("normalized_rmse") is not None and comparison["normalized_rmse"] <= 0.05):
+
+                          decision = "raw_to_drizzled_observable_level_supported_not_bitwise"
+
+                          decision_cert = "raw_to_drizzled_proxy_observable_level_supported_not_bitwise"
+
+                      else:
+
+                          decision = "raw_to_drizzled_failed_numeric_comparison"
+
+                          decision_cert = "raw_to_drizzled_proxy_failed_numeric_comparison"
+
+                  else:
+
+                      decision = "raw_to_drizzled_blocked_by_grid_or_shape_mismatch"
+
+                      decision_cert = "raw_to_drizzled_grid_or_shape_mismatch"
+
+          parameter_ledger = {
+
+              "timestamp_utc": now(),
+
+              "attempt_type": "bounded_proxy_drizzle_first_pass",
+
+              "not_claimed_as_full_astrodrizzle": True,
+
+              "purpose": "first numeric product comparison and blocker localization",
+
+              "crds_context": os.environ.get("CRDS_CONTEXT",""),
+
+              "full_astrodrizzle_required_for_final_exact_closure": True,
+
+          }
+
+          wcs_grid_contract = {
+
+              "timestamp_utc": now(),
+
+              "hlsp_reference_present": hlsp_present,
+
+              "same_grid_direct_pixel_comparison_required": True,
+
+              "current_attempt_grid_status": comparison.get("reason", "comparable" if comparison.get("comparable") else "not_attempted"),
+
+              "comparison": comparison,
+
+          }
+
+          summary = {
+
+              "timestamp_utc": now(),
+
+              "decision": decision,
+
+              "decision_certificate": decision_cert,
+
+              "raw_to_drizzled_exact_or_near_exact_supported": False,
+
+              "raw_to_drizzled_observable_level_supported_not_bitwise": decision == "raw_to_drizzled_observable_level_supported_not_bitwise",
+
+              "raw_to_drizzled_claimed": False,
+
+              "full_public_dark_matter_closure_claimed": False,
+
+              "input_ledger": input_ledger,
+
+              "comparison": comparison,
+
+              "attempt_log": attempt_log,
+
+              "claim_ceiling": "This first runner performs blocker localization and bounded product comparison. It does not claim full raw-to-drizzled reconstruction unless a later exact AstroDrizzle/grid contract passes.",
+
+          }
+
+          write_json("raw_to_drizzled_summary.json", summary)
+
+          write_json("raw_to_drizzled_decision.json", {
+
+              "timestamp_utc": now(),
+
+              "decision": decision,
+
+              "decision_certificate": decision_cert,
+
+              "raw_to_drizzled_claimed": False,
+
+          })
+
+          write_json("drizzle_parameter_ledger.json", parameter_ledger)
+
+          write_json("wcs_grid_contract.json", wcs_grid_contract)
+
+          write_json("comparison_metrics.json", comparison)
+
+          write_csv("comparison_metrics.csv", [comparison], sorted(comparison.keys()) if comparison else ["comparable"])
+
+          with open(os.path.join(LOGS, "astrodrizzle.log"), "w", encoding="utf-8") as f:
+
+              f.write("\n".join(attempt_log) + "\n")
+
+          print(json.dumps(summary, indent=2, sort_keys=True))
+
+          PY
+
+          micromamba run -n stenv-ti python raw_to_drizzled_runner.py
+
+      - name: Assert raw-to-drizzled artifact outputs
+
+        shell: bash
+
+        run: |
+
+          test -s ti_raw_to_drizzled_work/results/raw_to_drizzled_summary.json
+
+          test -s ti_raw_to_drizzled_work/results/raw_to_drizzled_decision.json
+
+          test -s ti_raw_to_drizzled_work/results/input_provenance_ledger.json
+
+          test -s ti_raw_to_drizzled_work/results/drizzle_parameter_ledger.json
+
+          test -s ti_raw_to_drizzled_work/results/wcs_grid_contract.json
+
+          test -s ti_raw_to_drizzled_work/results/comparison_metrics.json
+
+          test -s ti_raw_to_drizzled_work/results/comparison_metrics.csv
+
+      - name: Upload raw-to-drizzled artifacts
+
+        if: always()
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: ti-paperii-raw-to-drizzled-reconstruction-results
+
+          path: |
+
+            ti_raw_to_drizzled_work/results/**
+
+            ti_hstcal_replay_work/results/validation_report.json
+
+            ti_hstcal_replay_work/results/logs/**
+
+          if-no-files-found: warn
+
