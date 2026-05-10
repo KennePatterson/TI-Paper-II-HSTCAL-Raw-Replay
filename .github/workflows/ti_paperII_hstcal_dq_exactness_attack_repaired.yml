@@ -2,132 +2,324 @@ name: TI Paper II HSTCAL DQ Literal Exactness Attack Repaired
 
 on:
   workflow_dispatch:
+    inputs:
+      raw_package_url:
+        required: false
+        default: "https://github.com/KennePatterson/TI-Paper-II-HSTCAL-Raw-Replay/releases/download/v0.1-raw-package/TI_PAPER_II_TRUE_SCIENCE_RAW_EXPOSURE_SET_REPLAY_PACKAGE_UPDATED.zip"
+        type: string
+      raw_package_sha256:
+        required: false
+        default: "fa792f077f14a35756f10bfafd8401ca3e8e43dbd83e9f485b7077acb543de30"
+        type: string
+      stenv_yaml_url:
+        required: false
+        default: "https://github.com/spacetelescope/stenv/releases/download/2026.04.14/stenv-Linux-X64-py3.13-2026.04.14.yaml"
+        type: string
+      stenv_yaml_sha256:
+        required: false
+        default: "2f967290c3c9fe2a4b3911022a737d91cea72f52f0115ecacb4b1d355ad82cb8"
+        type: string
+      stenv_yaml_filename:
+        required: false
+        default: "stenv-Linux-X64-py3.13-2026.04.14.yaml"
+        type: string
+      crds_context:
+        required: false
+        default: "hst_1313.pmap"
+        type: string
 
 jobs:
   dq_literal_exactness_attack:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 180
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install Python packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3 python3-pip unzip curl
-          python3 -m pip install --upgrade pip --break-system-packages
-          python3 -m pip install --break-system-packages numpy pandas astropy
+      - name: Install micromamba
+        uses: mamba-org/setup-micromamba@v3
+        with:
+          init-shell: bash
+          cache-environment: false
+          post-cleanup: all
 
-      - name: Prepare directories
+      - name: Fetch stenv YAML
+        shell: bash
         run: |
-          mkdir -p ti_hstcal_dq_exactness_work/results/logs
-          mkdir -p ti_hstcal_dq_exactness_work/results/reports
+          set -euo pipefail
+          curl -L "${{ github.event.inputs.stenv_yaml_url }}" -o "${{ github.event.inputs.stenv_yaml_filename }}"
+          echo "${{ github.event.inputs.stenv_yaml_sha256 }}  ${{ github.event.inputs.stenv_yaml_filename }}" | sha256sum -c -
 
-      - name: Run all-in-one DQ exactness adjudicator
+      - name: Create stenv
+        shell: bash -l {0}
         run: |
-          cat > dq_exactness_all_in_one.py <<'PY'
-          import os, json, csv, zipfile
+          set -euo pipefail
+          micromamba env create --name stenv-ti --file "${{ github.event.inputs.stenv_yaml_filename }}" --use-uv
+          micromamba run -n stenv-ti python -V
+          micromamba run -n stenv-ti bash -lc 'which calwf3.e || which calwf3'
+          micromamba run -n stenv-ti python -c "import astropy, numpy, crds; print('ready')"
+
+      - name: Download raw package
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L "${{ github.event.inputs.raw_package_url }}" -o raw_package.zip
+          sha256sum raw_package.zip | tee raw_package.sha256
+          echo "${{ github.event.inputs.raw_package_sha256 }}  raw_package.zip" | sha256sum -c -
+
+      - name: Run baseline HSTCAL replay
+        shell: bash -l {0}
+        env:
+          CRDS_SERVER_URL: https://hst-crds.stsci.edu
+          CRDS_PATH: ${{ github.workspace }}/crds_cache
+          CRDS_CONTEXT: ${{ github.event.inputs.crds_context }}
+          iref: ${{ github.workspace }}/crds_cache/references/hst/wfc3/
+        run: |
+          set -euo pipefail
+          micromamba run -n stenv-ti bash scripts/run_hstcal_replay.sh raw_package.zip ti_hstcal_replay_work
+          echo "0" > baseline_replay_status.txt
+
+      - name: Real repaired DQ exactness adjudication
+        shell: bash -l {0}
+        run: |
+          cat > dq_real_adjudicator.py <<'PY'
+          import os, re, csv, json
           from datetime import datetime, timezone
+          import numpy as np
+          from astropy.io import fits
 
-          OUT = "ti_hstcal_dq_exactness_work/results"
+          OUT="ti_hstcal_dq_exactness_work/results"
           os.makedirs(OUT, exist_ok=True)
-          os.makedirs(os.path.join(OUT, "logs"), exist_ok=True)
+          os.makedirs(os.path.join(OUT,"logs"), exist_ok=True)
+
+          SCIENCE=["SCI","ERR","SAMP","TIME"]
+          ALL=["SCI","ERR","SAMP","TIME","DQ"]
 
           def now():
               return datetime.now(timezone.utc).isoformat()
 
-          def write_json(name, obj):
-              with open(os.path.join(OUT, name), "w") as f:
-                  json.dump(obj, f, indent=2, sort_keys=True)
+          def write_json(name,obj):
+              with open(os.path.join(OUT,name),"w") as f:
+                  json.dump(obj,f,indent=2,sort_keys=True)
 
-          def write_csv(name, rows, cols):
-              with open(os.path.join(OUT, name), "w", newline="") as f:
-                  w = csv.DictWriter(f, fieldnames=cols)
+          def write_csv(name,rows,cols):
+              with open(os.path.join(OUT,name),"w",newline="") as f:
+                  w=csv.DictWriter(f,fieldnames=cols)
                   w.writeheader()
                   for r in rows:
-                      w.writerow({c: r.get(c, "") for c in cols})
+                      w.writerow({c:r.get(c,"") for c in cols})
 
-          # This all-in-one workflow is an instrumentation repair.
-          # It does not pretend to prove DQ 20/20 unless generated/reference FITS
-          # or full exactness outputs are present in the runner workspace.
-          roots = []
-          for base, dirs, files in os.walk("."):
-              for fn in files:
-                  if fn.endswith("_flt.fits") or fn.endswith("_flc.fits"):
-                      roots.append(os.path.join(base, fn))
+          def root(path):
+              b=os.path.basename(path)
+              m=re.match(r"(.+?)_(flt|flc)\.fits$",b,re.I)
+              return m.group(1) if m else None
 
-          summary = {
-              "timestamp_utc": now(),
-              "workflow": "all_in_one_repaired_dq_exactness",
-              "instrumentation_repaired": True,
-              "external_script_dependency_removed": True,
-              "fits_products_seen": len(roots),
-              "literal_dq_exact_20of20_supported": False,
-              "decision": "instrumentation_repaired_but_no_generated_reference_fits_available_in_runner",
-              "decision_certificate": "dq_all_in_one_instrumentation_repaired_no_fits_products_for_literal_dq20",
-              "claim_ceiling": "This run repairs GitHub instrumentation and proves artifact emission works. It does not adjudicate literal DQ 20/20 unless generated/reference FITS products are present.",
-              "required_next": "Run full HSTCAL replay workflow or modify this all-in-one workflow to download/produce generated/reference FLT/FLC products before DQ comparison."
+          def collect(base):
+              out={}
+              if not os.path.exists(base):
+                  return out
+              for dp,_,fs in os.walk(base):
+                  for fn in fs:
+                      if fn.lower().endswith(("_flt.fits","_flc.fits")):
+                          r=root(fn)
+                          if r:
+                              out[r]=os.path.join(dp,fn)
+              return out
+
+          def ext(hdul,name):
+              for h in hdul:
+                  if str(h.header.get("EXTNAME","")).upper().strip()==name and h.data is not None:
+                      return h.data
+              return None
+
+          def exact(a,b):
+              if a is None or b is None:
+                  return False,None,None,None
+              if a.shape!=b.shape:
+                  return False,None,None,None
+              if np.issubdtype(a.dtype,np.floating) or np.issubdtype(b.dtype,np.floating):
+                  eq=(a==b) | (np.isnan(a)&np.isnan(b))
+              else:
+                  eq=(a==b)
+              changed=~eq
+              return bool(np.count_nonzero(changed)==0), changed, int(np.count_nonzero(changed)), int(a.size)
+
+          ref_dir="ti_hstcal_replay_work/results/normalized_package/data/calibrated_reference"
+          gen_dir="ti_hstcal_replay_work/results/generated"
+          ref=collect(ref_dir)
+          gen=collect(gen_dir)
+          roots=sorted(set(ref)|set(gen))
+
+          rows=[]
+          bitrows=[]
+          overlap=[]
+          direction=[]
+          exact_counts={e:0 for e in ALL}
+          failures=[]
+          dq_exact=[]
+          dq_mismatch=[]
+          dq_4096=[]
+          dq_non4096=[]
+          overlap_roots=[]
+
+          for r in roots:
+              row={"root":r,"reference_path":ref.get(r,""),"generated_path":gen.get(r,"")}
+              if r not in ref or r not in gen:
+                  failures.append({"root":r,"reason":"missing_reference_or_generated"})
+                  rows.append(row)
+                  continue
+
+              with fits.open(ref[r],memmap=False) as rh, fits.open(gen[r],memmap=False) as gh:
+                  rdq=ext(rh,"DQ")
+                  gdq=ext(gh,"DQ")
+                  dqmask=None
+                  xor_values=[]
+                  xor_hist={}
+                  xor_only_4096=False
+                  ref4096_gen_not=0
+                  gen4096_ref_not=0
+
+                  if rdq is not None and gdq is not None and rdq.shape==gdq.shape:
+                      g=gdq.astype(np.uint64)
+                      q=rdq.astype(np.uint64)
+                      xor=np.bitwise_xor(g,q)
+                      dqmask=xor!=0
+                      vals,counts=np.unique(xor[dqmask],return_counts=True) if np.count_nonzero(dqmask) else ([],[])
+                      xor_values=[int(v) for v in vals]
+                      xor_hist={str(int(v)):int(c) for v,c in zip(vals,counts)}
+                      xor_only_4096=(len(xor_values)==1 and xor_values[0]==4096)
+                      ref4096=(q & np.uint64(4096))!=0
+                      gen4096=(g & np.uint64(4096))!=0
+                      ref4096_gen_not=int(np.count_nonzero(dqmask & ref4096 & (~gen4096)))
+                      gen4096_ref_not=int(np.count_nonzero(dqmask & gen4096 & (~ref4096)))
+                      for bit in range(16):
+                          val=1<<bit
+                          c=int(np.count_nonzero((xor & np.uint64(val))!=0))
+                          if c:
+                              bitrows.append({"root":r,"bit_index":bit,"bit_value":val,"changed_pixel_count":c,"changed_pixel_fraction":c/int(xor.size)})
+
+                  science_overlap=False
+                  for e in ALL:
+                      ex,ch,c,total=exact(ext(gh,e),ext(rh,e))
+                      row[f"{e}_exact"]=ex
+                      row[f"{e}_changed_pixel_count"]=c
+                      row[f"{e}_total_pixel_count"]=total
+                      if ex:
+                          exact_counts[e]+=1
+                      if e in SCIENCE and ch is not None and dqmask is not None and ch.shape==dqmask.shape:
+                          ov=int(np.count_nonzero(ch & dqmask))
+                          if ov:
+                              science_overlap=True
+                          overlap.append({"root":r,"extension":e,"science_exact":ex,"dq_mismatch_pixels":row.get("DQ_changed_pixel_count"),"science_diff_pixels_total":c,"science_diff_pixels_overlap_dq_mismatch":ov})
+
+                  row["DQ_xor_values"]=json.dumps(xor_values)
+                  row["DQ_xor_histogram"]=json.dumps(xor_hist,sort_keys=True)
+                  row["DQ_xor_only_4096"]=xor_only_4096
+                  row["ref_has_4096_gen_not_count"]=ref4096_gen_not
+                  row["gen_has_4096_ref_not_count"]=gen4096_ref_not
+                  row["science_diff_overlap_DQ_mismatch"]=science_overlap
+
+                  if row.get("DQ_exact") is True:
+                      dq_exact.append(r)
+                  else:
+                      dq_mismatch.append(r)
+                      if xor_only_4096:
+                          dq_4096.append(r)
+                      else:
+                          dq_non4096.append(r)
+
+                  if science_overlap:
+                      overlap_roots.append(r)
+
+                  if row.get("DQ_exact") is not True:
+                      direction.append({
+                          "root":r,
+                          "ref_has_4096_gen_not_count":ref4096_gen_not,
+                          "gen_has_4096_ref_not_count":gen4096_ref_not,
+                          "direction":"reference_has_extra_4096" if ref4096_gen_not>gen4096_ref_not else ("generated_has_extra_4096" if gen4096_ref_not>ref4096_gen_not else "balanced_or_unknown")
+                      })
+
+              rows.append(row)
+
+          science20=all(exact_counts[e]==20 for e in SCIENCE)
+          literal_dq20=(exact_counts["DQ"]==20)
+          all4096=bool(dq_mismatch) and sorted(dq_mismatch)==sorted(dq_4096)
+          no_overlap=(len(overlap_roots)==0)
+
+          if literal_dq20 and science20:
+              decision="literal_dq_exact_20of20_supported"
+              cert="dq_real_literal_dq_exact_20of20_supported"
+          elif science20 and all4096 and no_overlap:
+              decision="literal_dq_exact_blocked_by_4096_only_no_science_overlap"
+              cert="dq_real_literal_dq_exact_blocked_4096_only_no_science_overlap"
+          elif failures:
+              decision="literal_dq_exact_incomplete_missing_products"
+              cert="dq_real_literal_dq_exact_incomplete_missing_products"
+          else:
+              decision="literal_dq_exact_blocked_by_non4096_or_science_overlap"
+              cert="dq_real_literal_dq_exact_blocked_non4096_or_science_overlap"
+
+          summary={
+              "timestamp_utc":now(),
+              "reference_root_count":len(ref),
+              "generated_root_count":len(gen),
+              "roots_seen_count":len(roots),
+              "failure_count":len(failures),
+              "failures":failures,
+              "extension_exact_counts":exact_counts,
+              "science_exact_all_20":science20,
+              "literal_dq_exact_20of20_supported":literal_dq20,
+              "dq_exact_count":exact_counts["DQ"],
+              "dq_mismatch_count":len(dq_mismatch),
+              "dq_exact_roots":dq_exact,
+              "dq_mismatch_roots":dq_mismatch,
+              "dq_xor_only_4096_roots":dq_4096,
+              "dq_non_4096_roots":dq_non4096,
+              "all_dq_mismatch_roots_xor_only_4096":all4096,
+              "roots_with_science_overlap":overlap_roots,
+              "no_science_overlap":no_overlap,
+              "decision":decision,
+              "decision_certificate":cert
           }
 
-          decision = {
-              "timestamp_utc": now(),
-              "decision": summary["decision"],
-              "decision_certificate": summary["decision_certificate"],
-              "literal_dq_exact_20of20_supported": False,
-              "science_exact_all_20": False,
-              "dq_exact_count": None,
-              "dq_mismatch_count": None
-          }
-
-          write_json("dq_exactness_attack_summary.json", summary)
-          write_json("dq_exactness_attack_decision.json", decision)
-
-          write_csv(
-              "dq_exactness_by_root.csv",
-              [],
-              ["root","SCI_exact","ERR_exact","SAMP_exact","TIME_exact","DQ_exact","DQ_xor_only_4096","science_diff_overlap_DQ_mismatch"]
-          )
-
-          write_csv(
-              "dq_exactness_by_bit.csv",
-              [],
-              ["root","bit_index","bit_value","changed_pixel_count","changed_pixel_fraction"]
-          )
-
-          write_csv(
-              "dq_4096_direction_by_root.csv",
-              [],
-              ["root","ref_has_4096_gen_not_count","gen_has_4096_ref_not_count","direction"]
-          )
-
-          write_csv(
-              "science_overlap_audit.csv",
-              [],
-              ["root","extension","science_exact","dq_mismatch_pixels","science_diff_pixels_total","science_diff_pixels_overlap_dq_mismatch"]
-          )
-
-          with open(os.path.join(OUT, "dq_exactness_attack_status.txt"), "w") as f:
-              f.write("0\n")
-
-          with open(os.path.join(OUT, "astrodrizzle_attempt_status.txt"), "w") as f:
-              f.write("not_attempted\n")
-
-          write_json("astrodrizzle_update_attempt_summary.json", {
-              "timestamp_utc": now(),
-              "attempted": False,
-              "reason": "all_in_one_instrumentation_repair_only"
+          write_json("dq_exactness_attack_summary.json",summary)
+          write_json("dq_exactness_attack_decision.json",{
+              "timestamp_utc":now(),
+              "decision":decision,
+              "decision_certificate":cert,
+              "literal_dq_exact_20of20_supported":literal_dq20,
+              "science_exact_all_20":science20,
+              "dq_exact_count":exact_counts["DQ"],
+              "dq_mismatch_count":len(dq_mismatch)
           })
 
-          with open(os.path.join(OUT, "logs", "dq_exactness_all_in_one.log"), "w") as f:
-              f.write(json.dumps(summary, indent=2, sort_keys=True))
+          write_csv("dq_exactness_by_root.csv",rows,[
+              "root","SCI_exact","ERR_exact","SAMP_exact","TIME_exact","DQ_exact",
+              "SCI_changed_pixel_count","ERR_changed_pixel_count","SAMP_changed_pixel_count","TIME_changed_pixel_count","DQ_changed_pixel_count",
+              "SCI_total_pixel_count","ERR_total_pixel_count","SAMP_total_pixel_count","TIME_total_pixel_count","DQ_total_pixel_count",
+              "DQ_xor_values","DQ_xor_histogram","DQ_xor_only_4096",
+              "ref_has_4096_gen_not_count","gen_has_4096_ref_not_count",
+              "science_diff_overlap_DQ_mismatch","reference_path","generated_path"
+          ])
+          write_csv("dq_exactness_by_bit.csv",bitrows,["root","bit_index","bit_value","changed_pixel_count","changed_pixel_fraction"])
+          write_csv("dq_4096_direction_by_root.csv",direction,["root","ref_has_4096_gen_not_count","gen_has_4096_ref_not_count","direction"])
+          write_csv("science_overlap_audit.csv",overlap,["root","extension","science_exact","dq_mismatch_pixels","science_diff_pixels_total","science_diff_pixels_overlap_dq_mismatch"])
 
-          print(json.dumps(summary, indent=2, sort_keys=True))
+          with open(os.path.join(OUT,"dq_exactness_attack_status.txt"),"w") as f:
+              f.write("0\n")
+          with open(os.path.join(OUT,"astrodrizzle_attempt_status.txt"),"w") as f:
+              f.write("not_attempted\n")
+          write_json("astrodrizzle_update_attempt_summary.json",{"timestamp_utc":now(),"attempted":False,"reason":"DQ exactness adjudication only"})
+          with open(os.path.join(OUT,"logs","dq_real_adjudicator.log"),"w") as f:
+              f.write(json.dumps(summary,indent=2,sort_keys=True))
+          print(json.dumps(summary,indent=2,sort_keys=True))
           PY
 
-          python3 dq_exactness_all_in_one.py
+          micromamba run -n stenv-ti python dq_real_adjudicator.py
 
       - name: Assert required outputs exist
+        shell: bash
         run: |
           test -s ti_hstcal_dq_exactness_work/results/dq_exactness_attack_summary.json
           test -s ti_hstcal_dq_exactness_work/results/dq_exactness_attack_decision.json
@@ -135,12 +327,16 @@ jobs:
           test -s ti_hstcal_dq_exactness_work/results/dq_exactness_by_bit.csv
           test -s ti_hstcal_dq_exactness_work/results/dq_4096_direction_by_root.csv
           test -s ti_hstcal_dq_exactness_work/results/science_overlap_audit.csv
-          test -s ti_hstcal_dq_exactness_work/results/dq_exactness_attack_status.txt
-          test -s ti_hstcal_dq_exactness_work/results/astrodrizzle_update_attempt_summary.json
 
       - name: Upload repaired artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ti-paperii-hstcal-dq-literal-exactness-attack-repaired-results
-          path: ti_hstcal_dq_exactness_work/results
-          if-no-files-found: error
+          path: |
+            raw_package.sha256
+            baseline_replay_status.txt
+            ti_hstcal_replay_work/results/validation_report.json
+            ti_hstcal_replay_work/results/logs/**
+            ti_hstcal_dq_exactness_work/results/**
+          if-no-files-found: warn
