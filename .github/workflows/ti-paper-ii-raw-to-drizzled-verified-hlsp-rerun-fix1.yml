@@ -1,0 +1,879 @@
+name: TI Paper II Raw-to-Drizzled Verified HLSP Rerun Fix1
+
+on:
+  workflow_dispatch:
+    inputs:
+      hlsp_reference_url:
+        description: "Verified public HLSP drizzled SCI FITS reference URL from fix11_fix10"
+        required: true
+        default: "https://mast.stsci.edu/api/v0.1/Download/file?uri=mast%3AHLSP%2Furl%2Fcgi-bin%2Fgetdata.cgi%3Fdataset%3Dhlsp_frontier_hst_wfc3-30mas_macs0416_f125w_v1.0_drz"
+        type: string
+      raw_to_drizzled_command:
+        description: "Preferred explicit repo command that generates the drizzled FITS product before comparison"
+        required: false
+        default: ""
+        type: string
+      allow_bounded_auto_command_discovery:
+        description: "If true and raw_to_drizzled_command is blank, try obvious repo-local raw-to-drizzled scripts only"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      generated_drizzled_glob:
+        description: "Comma-separated glob patterns for generated drizzled FITS products"
+        required: false
+        default: "ti_work/**/*.fits,ti_work/**/*.fits.gz,results/**/*.fits,results/**/*.fits.gz,outputs/**/*.fits,outputs/**/*.fits.gz,artifacts/**/*.fits,artifacts/**/*.fits.gz,**/*drz*.fits,**/*drz*.fits.gz,**/*drc*.fits,**/*drc*.fits.gz,**/*drizzled*.fits,**/*drizzled*.fits.gz"
+        type: string
+
+jobs:
+  raw_to_drizzled_verified_hlsp_rerun_fix1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy astropy requests
+
+      - name: Prepare TI work directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ti_work/results/logs
+          mkdir -p ti_work/results/ledgers
+          mkdir -p ti_work/results/contracts
+          mkdir -p ti_work/results/reports
+          mkdir -p ti_work/inputs
+          mkdir -p ti_work/generated
+
+      - name: Write smarter workflow harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > ti_work/ti_raw_to_drizzled_verified_reference_harness_fix1.py <<'PY'
+          import os
+          import re
+          import glob
+          import json
+          import time
+          import hashlib
+          import subprocess
+          import traceback
+          from datetime import datetime, timezone
+          from urllib.parse import urlparse, unquote
+
+          import numpy as np
+          import requests
+          from astropy.io import fits
+
+          STAGE_TAG = "github_raw_to_drizzled_verified_hlsp_rerun_fix1_after_fix11_fix11"
+          FIX10_CERTIFICATE = "phase4z6_fix11_fix10_mast_exact_datauri_public_hlsp_drizzled_sci_reference_download_verified_contract_compiled"
+
+          HLSP_REFERENCE_URL = os.environ.get("HLSP_REFERENCE_URL", "").strip()
+          RAW_TO_DRIZZLED_COMMAND = os.environ.get("RAW_TO_DRIZZLED_COMMAND", "").strip()
+          ALLOW_BOUNDED_AUTO_COMMAND_DISCOVERY = os.environ.get("ALLOW_BOUNDED_AUTO_COMMAND_DISCOVERY", "true").strip().lower() == "true"
+          GENERATED_DRIZZLED_GLOB = os.environ.get("GENERATED_DRIZZLED_GLOB", "").strip()
+
+          REPO_ROOT = os.getcwd()
+          WORK = os.path.join(REPO_ROOT, "ti_work")
+          INPUTS = os.path.join(WORK, "inputs")
+          RESULTS = os.path.join(WORK, "results")
+          LEDGERS = os.path.join(RESULTS, "ledgers")
+          CONTRACTS = os.path.join(RESULTS, "contracts")
+          REPORTS = os.path.join(RESULTS, "reports")
+          LOGS = os.path.join(RESULTS, "logs")
+
+          for p in [INPUTS, RESULTS, LEDGERS, CONTRACTS, REPORTS, LOGS]:
+              os.makedirs(p, exist_ok=True)
+
+          FITS_EXTENSIONS = (".fits", ".fit", ".fts", ".fits.gz", ".fit.gz", ".fts.gz", ".fz")
+
+          BAD_FILE_BASENAME_TOKENS = [
+              "wht", "weight", "ctx", "context", "rms", "ivar", "mask",
+              "seg", "segm", "bkg", "background", "psf", "cat", "catalog",
+              "tar", "tar.gz", "zip", "flt", "flc", "raw", "asn", "readme",
+              "html", "png", "jpg", "jpeg", "gif", "pdf", "ecsv", "xml", "log"
+          ]
+
+          GOOD_LOCATOR_TOKENS = [
+              "drz", "drc", "drizzle", "drizzled", "mosaic",
+              "macs0416", "f125w", "hlsp", "frontier", "hff", "sci"
+          ]
+
+          def now():
+              return datetime.now(timezone.utc).isoformat()
+
+          def write_json(path, obj):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              tmp = path + ".tmp"
+              with open(tmp, "w", encoding="utf-8") as f:
+                  json.dump(obj, f, indent=2, sort_keys=True, ensure_ascii=False)
+              os.replace(tmp, path)
+
+          def write_text(path, text):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              tmp = path + ".tmp"
+              with open(tmp, "w", encoding="utf-8") as f:
+                  f.write(text)
+              os.replace(tmp, path)
+
+          def sha256_file(path, prefix_bytes=64 * 1024 * 1024, full_hash_max_bytes=512 * 1024 * 1024):
+              out = {
+                  "path": path,
+                  "exists": os.path.exists(path) if path else False,
+                  "size_bytes": None,
+                  "sha256_full": None,
+                  "sha256_prefix_bytes": None,
+                  "sha256_prefix": None,
+                  "hash_error": None,
+              }
+              if not path or not os.path.exists(path):
+                  return out
+              try:
+                  size = os.path.getsize(path)
+                  out["size_bytes"] = int(size)
+
+                  hp = hashlib.sha256()
+                  remaining = min(size, prefix_bytes)
+                  with open(path, "rb") as f:
+                      while remaining > 0:
+                          chunk = f.read(min(1024 * 1024, remaining))
+                          if not chunk:
+                              break
+                          hp.update(chunk)
+                          remaining -= len(chunk)
+                  out["sha256_prefix_bytes"] = int(min(size, prefix_bytes))
+                  out["sha256_prefix"] = hp.hexdigest()
+
+                  if size <= full_hash_max_bytes:
+                      hf = hashlib.sha256()
+                      with open(path, "rb") as f:
+                          for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                              hf.update(chunk)
+                      out["sha256_full"] = hf.hexdigest()
+                  return out
+              except Exception as e:
+                  out["hash_error"] = repr(e)
+                  return out
+
+          def norm_compact(s):
+              return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
+
+          def is_fits_like(path_or_name):
+              return str(path_or_name).lower().endswith(FITS_EXTENSIONS)
+
+          def is_bad_aux_or_raw_basename(path_or_name):
+              # Fix1: basename only, not parent folders like TI-Paper-II-HSTCAL-Raw-Replay.
+              base = os.path.basename(str(path_or_name or ""))
+              n = norm_compact(base)
+              return any(norm_compact(tok) in n for tok in BAD_FILE_BASENAME_TOKENS)
+
+          def run_shell_command(command, label, timeout_seconds=18000):
+              out = {
+                  "label": label,
+                  "command": command,
+                  "attempted": True,
+                  "exit_status": None,
+                  "stdout_path": os.path.join(LOGS, f"{label}.stdout.log"),
+                  "stderr_path": os.path.join(LOGS, f"{label}.stderr.log"),
+                  "error": None,
+              }
+              try:
+                  with open(out["stdout_path"], "w", encoding="utf-8") as stdout, open(out["stderr_path"], "w", encoding="utf-8") as stderr:
+                      proc = subprocess.run(
+                          command,
+                          shell=True,
+                          cwd=REPO_ROOT,
+                          stdout=stdout,
+                          stderr=stderr,
+                          timeout=timeout_seconds,
+                      )
+                  out["exit_status"] = int(proc.returncode)
+              except Exception as e:
+                  out["error"] = repr(e)
+                  out["traceback"] = traceback.format_exc()[-4000:]
+              return out
+
+          def inventory_repo_files():
+              records = []
+              for root, dirs, files in os.walk(REPO_ROOT):
+                  dirs[:] = [
+                      d for d in dirs
+                      if d not in {".git", "__pycache__", ".pytest_cache", ".mypy_cache"}
+                      and not root.startswith(os.path.join(REPO_ROOT, "ti_work", "results"))
+                  ]
+                  for fn in files:
+                      path = os.path.join(root, fn)
+                      rel = os.path.relpath(path, REPO_ROOT)
+                      try:
+                          size = os.path.getsize(path)
+                      except Exception:
+                          size = None
+                      lower = rel.lower()
+                      locator_score = 0
+                      for tok in ["drizzle", "drizzled", "astrodrizzle", "raw_to_drizzled", "raw-to-drizzled", "hstcal", "fits", "flt", "flc", "drz", "drc"]:
+                          if tok in lower:
+                              locator_score += 1
+                      if locator_score > 0 or lower.endswith((".py", ".sh", ".yml", ".yaml", ".fits", ".fits.gz")):
+                          records.append({
+                              "path": path,
+                              "path_rel_repo": rel,
+                              "size_bytes": size,
+                              "locator_score": locator_score,
+                              "is_fits_like": is_fits_like(path),
+                              "mtime": os.path.getmtime(path) if os.path.exists(path) else None,
+                          })
+              return sorted(records, key=lambda x: (-x["locator_score"], x["path_rel_repo"]))
+
+          def likely_auto_commands(inventory):
+              commands = []
+              exact_candidates = [
+                  "scripts/raw_to_drizzled.py",
+                  "scripts/replay_raw_to_drizzled.py",
+                  "raw_to_drizzled.py",
+                  "replay_raw_to_drizzled.py",
+                  "run_raw_to_drizzled.py",
+                  "run_drizzle.py",
+                  "astrodrizzle_replay.py",
+                  "scripts/run_raw_to_drizzled.sh",
+                  "run_raw_to_drizzled.sh",
+              ]
+              for rel in exact_candidates:
+                  if os.path.exists(os.path.join(REPO_ROOT, rel)):
+                      if rel.endswith(".py"):
+                          commands.append(f"python {rel}")
+                      elif rel.endswith(".sh"):
+                          commands.append(f"bash {rel}")
+
+              for rec in inventory:
+                  rel = rec["path_rel_repo"]
+                  low = rel.lower()
+                  if not rel.endswith(".py"):
+                      continue
+                  if "ti_work/" in low:
+                      continue
+                  if ("drizzle" in low or "drizzled" in low or "astrodrizzle" in low) and ("raw" in low or "replay" in low or "hst" in low):
+                      cmd = f"python {rel}"
+                      if cmd not in commands:
+                          commands.append(cmd)
+                  if len(commands) >= 5:
+                      break
+              return commands[:5]
+
+          def download_reference(url):
+              out_path = os.path.join(INPUTS, "verified_hlsp_reference.fits")
+              if url.lower().endswith(".gz") or ".fits.gz" in url.lower():
+                  out_path = os.path.join(INPUTS, "verified_hlsp_reference.fits.gz")
+
+              result = {
+                  "url": url,
+                  "out_path": out_path,
+                  "ok": False,
+                  "status_code": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "bytes_written": 0,
+                  "error": None,
+                  "final_url": url,
+              }
+              try:
+                  headers = {"User-Agent": "TI-PaperII-GitHubRawToDrizzledHarnessFix1/1.0"}
+                  with requests.get(url, stream=True, timeout=120, allow_redirects=True, headers=headers) as r:
+                      result["status_code"] = int(r.status_code)
+                      result["content_type"] = r.headers.get("content-type")
+                      result["content_length"] = int(r.headers.get("content-length", "0") or 0)
+                      result["final_url"] = r.url
+                      if not (200 <= r.status_code < 400):
+                          result["error"] = f"http_status:{r.status_code}"
+                          return result
+                      tmp = out_path + ".tmp"
+                      written = 0
+                      with open(tmp, "wb") as f:
+                          for chunk in r.iter_content(chunk_size=1024 * 1024):
+                              if not chunk:
+                                  continue
+                              f.write(chunk)
+                              written += len(chunk)
+                      os.replace(tmp, out_path)
+                      result["bytes_written"] = written
+                      result["ok"] = True
+              except Exception as e:
+                  result["error"] = repr(e)
+                  result["traceback"] = traceback.format_exc()[-4000:]
+              return result
+
+          def image_hdu_candidates(path):
+              candidates = []
+              with fits.open(path, memmap=True, lazy_load_hdus=True) as hdul:
+                  for idx, hdu in enumerate(hdul):
+                      data = getattr(hdu, "data", None)
+                      if data is None:
+                          continue
+                      try:
+                          shape = tuple(int(x) for x in data.shape)
+                      except Exception:
+                          continue
+                      if len(shape) < 2:
+                          continue
+                      pixels = int(shape[-1] * shape[-2])
+                      hdr = hdu.header
+                      wcs_keys = [k for k in [
+                          "CTYPE1", "CTYPE2", "CRPIX1", "CRPIX2", "CRVAL1", "CRVAL2",
+                          "CDELT1", "CDELT2", "CD1_1", "CD1_2", "CD2_1", "CD2_2",
+                          "PC1_1", "PC1_2", "PC2_1", "PC2_2", "CUNIT1", "CUNIT2",
+                          "RADESYS", "EQUINOX", "WCSNAME"
+                      ] if k in hdr]
+                      wcs_like = (
+                          ("CTYPE1" in hdr and "CTYPE2" in hdr)
+                          and (
+                              ("CRPIX1" in hdr and "CRPIX2" in hdr)
+                              or ("CD1_1" in hdr and "CD2_2" in hdr)
+                              or ("CDELT1" in hdr and "CDELT2" in hdr)
+                              or ("PC1_1" in hdr and "PC2_2" in hdr)
+                          )
+                      )
+                      candidates.append({
+                          "hdu_index": idx,
+                          "extname": str(hdr.get("EXTNAME", "")),
+                          "shape": shape,
+                          "pixels": pixels,
+                          "dtype": str(data.dtype),
+                          "wcs_like": bool(wcs_like),
+                          "wcs_keys_present": sorted(wcs_keys),
+                          "bunit": str(hdr.get("BUNIT", "")),
+                          "filter": str(hdr.get("FILTER", hdr.get("FILTER1", ""))),
+                          "instrume": str(hdr.get("INSTRUME", "")),
+                          "detector": str(hdr.get("DETECTOR", "")),
+                          "object": str(hdr.get("OBJECT", "")),
+                          "targname": str(hdr.get("TARGNAME", "")),
+                      })
+              return candidates
+
+          def inspect_fits(path):
+              out = {
+                  "path": path,
+                  "path_rel_repo": os.path.relpath(path, REPO_ROOT) if os.path.exists(path) else None,
+                  "basename": os.path.basename(path or ""),
+                  "exists": os.path.exists(path),
+                  "hash": sha256_file(path),
+                  "fits_openable": False,
+                  "fits_error": None,
+                  "hdu_count": None,
+                  "image_hdu_candidates": [],
+                  "selected_hdu_index": None,
+                  "selected_shape": None,
+                  "selected_pixels": None,
+                  "wcs_like": False,
+                  "product_role": "unknown",
+                  "auxiliary_or_raw_like": is_bad_aux_or_raw_basename(path),
+                  "raw_like_scope_fixed_to_basename_only": True,
+              }
+              if not os.path.exists(path):
+                  out["fits_error"] = "missing_file"
+                  return out
+              try:
+                  with fits.open(path, memmap=True, lazy_load_hdus=True) as hdul:
+                      out["fits_openable"] = True
+                      out["hdu_count"] = len(hdul)
+                  candidates = image_hdu_candidates(path)
+                  out["image_hdu_candidates"] = candidates
+                  if candidates:
+                      candidates_sorted = sorted(
+                          candidates,
+                          key=lambda x: (0 if x.get("wcs_like") else 1, -int(x.get("pixels") or 0))
+                      )
+                      selected = candidates_sorted[0]
+                      out["selected_hdu_index"] = selected["hdu_index"]
+                      out["selected_shape"] = selected["shape"]
+                      out["selected_pixels"] = selected["pixels"]
+                      out["wcs_like"] = bool(selected.get("wcs_like"))
+                      if out["auxiliary_or_raw_like"]:
+                          out["product_role"] = "auxiliary_or_raw_like"
+                      elif out["wcs_like"] and (out["selected_pixels"] or 0) >= 1_000_000:
+                          out["product_role"] = "science_image_candidate"
+                      else:
+                          out["product_role"] = "image_not_contract_ready"
+              except Exception as e:
+                  out["fits_error"] = repr(e)
+                  out["traceback"] = traceback.format_exc()[-4000:]
+              return out
+
+          def select_image_array(path, hdu_index):
+              with fits.open(path, memmap=True, lazy_load_hdus=True) as hdul:
+                  data = hdul[hdu_index].data
+                  arr = np.asarray(data, dtype=np.float64)
+                  if arr.ndim > 2:
+                      arr = arr.reshape((-1,) + arr.shape[-2:])[0]
+                  return arr
+
+          def collect_generated_candidates(reference_path, before_inventory):
+              before_paths = {os.path.abspath(x["path"]): x for x in before_inventory if x.get("is_fits_like")}
+              patterns = [p.strip() for p in GENERATED_DRIZZLED_GLOB.split(",") if p.strip()]
+              if not patterns:
+                  patterns = [
+                      "ti_work/**/*.fits", "ti_work/**/*.fits.gz",
+                      "results/**/*.fits", "results/**/*.fits.gz",
+                      "outputs/**/*.fits", "outputs/**/*.fits.gz",
+                      "artifacts/**/*.fits", "artifacts/**/*.fits.gz",
+                      "**/*drz*.fits", "**/*drz*.fits.gz",
+                      "**/*drc*.fits", "**/*drc*.fits.gz",
+                      "**/*drizzled*.fits", "**/*drizzled*.fits.gz",
+                  ]
+
+              paths = []
+              for pat in patterns:
+                  paths.extend(glob.glob(pat, recursive=True))
+
+              ref_abs = os.path.abspath(reference_path) if reference_path else ""
+              out = []
+              for p in sorted(set(paths)):
+                  if not os.path.isfile(p):
+                      continue
+                  ap = os.path.abspath(p)
+                  if ap == ref_abs:
+                      continue
+                  if "/.git/" in ap:
+                      continue
+                  if not is_fits_like(ap):
+                      continue
+
+                  mtime = os.path.getmtime(ap)
+                  before = before_paths.get(ap)
+                  created_or_modified_this_run = before is None or mtime > float(before.get("mtime") or 0) + 0.001
+
+                  compact = norm_compact(os.path.basename(ap))
+                  score = 0
+                  reasons = []
+                  for tok in GOOD_LOCATOR_TOKENS:
+                      if norm_compact(tok) in compact:
+                          score += 5
+                          reasons.append(f"basename_locator_token:{tok}")
+                  if created_or_modified_this_run:
+                      score += 20
+                      reasons.append("created_or_modified_this_run")
+                  if is_bad_aux_or_raw_basename(ap):
+                      score -= 50
+                      reasons.append("bad_aux_or_raw_basename")
+                  if "verified_hlsp_reference" in compact:
+                      score -= 100
+                      reasons.append("reference_file_exclusion")
+
+                  out.append({
+                      "path": ap,
+                      "path_rel_repo": os.path.relpath(ap, REPO_ROOT),
+                      "size_bytes": os.path.getsize(ap),
+                      "mtime": mtime,
+                      "created_or_modified_this_run": created_or_modified_this_run,
+                      "locator_score": score,
+                      "locator_reasons": reasons,
+                      "token_matches_are_locator_only_not_evidence": True,
+                  })
+
+              return sorted(out, key=lambda x: (-x["locator_score"], 0 if x["created_or_modified_this_run"] else 1, -x["size_bytes"]))
+
+          def compare_arrays(reference_path, reference_hdu, generated_path, generated_hdu):
+              ref = select_image_array(reference_path, reference_hdu)
+              gen = select_image_array(generated_path, generated_hdu)
+
+              result = {
+                  "reference_shape": tuple(int(x) for x in ref.shape),
+                  "generated_shape": tuple(int(x) for x in gen.shape),
+                  "same_shape": tuple(ref.shape) == tuple(gen.shape),
+                  "comparison_attempted": False,
+                  "error": None,
+              }
+
+              if not result["same_shape"]:
+                  result["error"] = "shape_mismatch"
+                  return result
+
+              mask = np.isfinite(ref) & np.isfinite(gen)
+              finite_count = int(mask.sum())
+              total_count = int(mask.size)
+              result["comparison_attempted"] = True
+              result["finite_count"] = finite_count
+              result["total_count"] = total_count
+              result["finite_fraction"] = float(finite_count / total_count) if total_count else 0.0
+
+              if finite_count == 0:
+                  result["error"] = "no_finite_overlap"
+                  return result
+
+              d = gen[mask] - ref[mask]
+              ad = np.abs(d)
+              ref_abs = np.abs(ref[mask])
+              ref_scale = float(np.nanpercentile(ref_abs, 99)) if finite_count else 0.0
+              ref_scale = max(ref_scale, 1.0)
+
+              result.update({
+                  "max_abs_diff": float(np.nanmax(ad)),
+                  "mean_abs_diff": float(np.nanmean(ad)),
+                  "median_abs_diff": float(np.nanmedian(ad)),
+                  "p90_abs_diff": float(np.nanpercentile(ad, 90)),
+                  "p95_abs_diff": float(np.nanpercentile(ad, 95)),
+                  "p99_abs_diff": float(np.nanpercentile(ad, 99)),
+                  "rms_abs_diff": float(np.sqrt(np.nanmean(d * d))),
+                  "reference_abs_p99_scale": ref_scale,
+                  "max_rel_to_ref_p99": float(np.nanmax(ad) / ref_scale),
+                  "p99_rel_to_ref_p99": float(np.nanpercentile(ad, 99) / ref_scale),
+                  "arrays_bitwise_equal_on_finite": bool(np.array_equal(gen[mask], ref[mask])),
+                  "allclose_rtol_1e_6_atol_1e_8": bool(np.allclose(gen[mask], ref[mask], rtol=1e-6, atol=1e-8)),
+                  "allclose_rtol_1e_5_atol_1e_7": bool(np.allclose(gen[mask], ref[mask], rtol=1e-5, atol=1e-7)),
+              })
+
+              result["numeric_replay_supported_strict"] = bool(
+                  result["finite_fraction"] >= 0.999
+                  and (
+                      result["arrays_bitwise_equal_on_finite"]
+                      or result["allclose_rtol_1e_6_atol_1e_8"]
+                      or (
+                          result["p99_abs_diff"] <= max(1e-6, 1e-8 * ref_scale)
+                          and result["max_abs_diff"] <= max(1e-4, 1e-6 * ref_scale)
+                      )
+                  )
+              )
+              return result
+
+          def main():
+              run_started = time.time()
+
+              stage_sanity = {
+                  "timestamp_utc": now(),
+                  "stage_tag": STAGE_TAG,
+                  "github_actions": True,
+                  "repo_root": REPO_ROOT,
+                  "hlsp_reference_url_supplied": bool(HLSP_REFERENCE_URL),
+                  "raw_to_drizzled_command_supplied": bool(RAW_TO_DRIZZLED_COMMAND),
+                  "allow_bounded_auto_command_discovery": ALLOW_BOUNDED_AUTO_COMMAND_DISCOVERY,
+                  "generated_drizzled_glob": GENERATED_DRIZZLED_GLOB,
+                  "fix1_raw_like_scope_fixed_to_basename_only": True,
+                  "no_semantics_as_evidence": True,
+                  "raw_to_drizzled_claimed": False,
+                  "full_public_dark_matter_closure_claimed": False,
+              }
+              write_json(os.path.join(RESULTS, "mount_root_sanity.json"), stage_sanity)
+
+              predecessor_contract = {
+                  "timestamp_utc": now(),
+                  "stage_tag": STAGE_TAG,
+                  "predecessor_fix10_certificate": FIX10_CERTIFICATE,
+                  "verified_hlsp_reference_url": HLSP_REFERENCE_URL,
+                  "claim_ceiling": "github_rerun_numeric_artifact_generation_only",
+                  "raw_to_drizzled_claimed": False,
+                  "full_public_dark_matter_closure_claimed": False,
+                  "no_semantics_as_evidence": True,
+              }
+              write_json(os.path.join(CONTRACTS, "predecessor_reference_contract.json"), predecessor_contract)
+
+              before_inventory = inventory_repo_files()
+              write_json(os.path.join(LEDGERS, "repo_inventory_before_generation.json"), {
+                  "timestamp_utc": now(),
+                  "file_count": len(before_inventory),
+                  "files": before_inventory[:2000],
+              })
+
+              if not HLSP_REFERENCE_URL:
+                  reference_download = {"ok": False, "error": "missing_hlsp_reference_url"}
+                  reference_inspection = {"fits_openable": False}
+              else:
+                  reference_download = download_reference(HLSP_REFERENCE_URL)
+                  reference_inspection = inspect_fits(reference_download.get("out_path")) if reference_download.get("ok") else {
+                      "fits_openable": False,
+                      "fits_error": reference_download.get("error"),
+                  }
+
+              write_json(os.path.join(LEDGERS, "public_reference_download_ledger.json"), reference_download)
+              write_json(os.path.join(LEDGERS, "public_reference_fits_inspection.json"), reference_inspection)
+
+              inventory = inventory_repo_files()
+              if RAW_TO_DRIZZLED_COMMAND:
+                  commands = [RAW_TO_DRIZZLED_COMMAND]
+                  command_strategy = "explicit_user_supplied_command"
+              elif ALLOW_BOUNDED_AUTO_COMMAND_DISCOVERY:
+                  commands = likely_auto_commands(inventory)
+                  command_strategy = "bounded_auto_discovery"
+              else:
+                  commands = []
+                  command_strategy = "no_command_and_auto_discovery_disabled"
+
+              command_results = []
+              if commands:
+                  for i, cmd in enumerate(commands, start=1):
+                      label = f"generation_command_{i:02d}"
+                      command_results.append(run_shell_command(cmd, label))
+                      tmp_candidates = collect_generated_candidates(reference_download.get("out_path"), before_inventory)
+                      if command_results[-1].get("exit_status") == 0 and tmp_candidates:
+                          break
+
+              write_json(os.path.join(LEDGERS, "generation_command_ledger.json"), {
+                  "timestamp_utc": now(),
+                  "command_strategy": command_strategy,
+                  "candidate_commands": commands,
+                  "command_results": command_results,
+                  "bounded_repo_local_auto_discovery_only": True,
+                  "no_semantics_as_evidence": True,
+              })
+
+              after_inventory = inventory_repo_files()
+              write_json(os.path.join(LEDGERS, "repo_inventory_after_generation.json"), {
+                  "timestamp_utc": now(),
+                  "file_count": len(after_inventory),
+                  "files": after_inventory[:3000],
+              })
+
+              generated_candidates = collect_generated_candidates(reference_download.get("out_path"), before_inventory)
+              inspected_generated = []
+              for cand in generated_candidates[:300]:
+                  insp = inspect_fits(cand["path"])
+                  rec = dict(cand)
+                  rec["fits_inspection"] = insp
+                  rec["contract_ready_candidate"] = bool(
+                      insp.get("fits_openable")
+                      and insp.get("wcs_like")
+                      and insp.get("product_role") == "science_image_candidate"
+                      and not insp.get("auxiliary_or_raw_like")
+                  )
+                  rec["same_shape_as_reference"] = bool(insp.get("selected_shape") == reference_inspection.get("selected_shape"))
+                  inspected_generated.append(rec)
+
+              inspected_generated = sorted(
+                  inspected_generated,
+                  key=lambda x: (
+                      0 if x.get("contract_ready_candidate") else 1,
+                      0 if x.get("same_shape_as_reference") else 1,
+                      0 if x.get("created_or_modified_this_run") else 1,
+                      -int(x.get("locator_score") or 0),
+                      -int(x.get("size_bytes") or 0),
+                  )
+              )
+              write_json(os.path.join(LEDGERS, "generated_drizzled_candidate_ledger.json"), {
+                  "timestamp_utc": now(),
+                  "candidate_count": len(generated_candidates),
+                  "inspected_candidate_count": len(inspected_generated),
+                  "candidates": inspected_generated,
+                  "token_matches_are_locator_only_not_evidence": True,
+              })
+
+              selected_generated = inspected_generated[0] if inspected_generated else None
+
+              if reference_download.get("ok") and reference_inspection.get("fits_openable") and selected_generated and selected_generated.get("contract_ready_candidate"):
+                  comparison = compare_arrays(
+                      reference_download["out_path"],
+                      reference_inspection["selected_hdu_index"],
+                      selected_generated["path"],
+                      selected_generated["fits_inspection"]["selected_hdu_index"],
+                  )
+              else:
+                  comparison = {"comparison_attempted": False, "reason": None}
+                  if not reference_download.get("ok"):
+                      comparison["reason"] = "reference_download_failed"
+                  elif not reference_inspection.get("fits_openable"):
+                      comparison["reason"] = "reference_fits_not_openable"
+                  elif not selected_generated:
+                      comparison["reason"] = "no_generated_drizzled_candidate_found"
+                  elif not selected_generated.get("contract_ready_candidate"):
+                      comparison["reason"] = "no_contract_ready_generated_drizzled_candidate_found"
+
+              comparison_artifact = {
+                  "timestamp_utc": now(),
+                  "stage_tag": STAGE_TAG,
+                  "reference": {
+                      "url": HLSP_REFERENCE_URL,
+                      "download": reference_download,
+                      "fits_inspection": reference_inspection,
+                  },
+                  "command_strategy": command_strategy,
+                  "command_results": command_results,
+                  "selected_generated_candidate": selected_generated,
+                  "numeric_comparison": comparison,
+                  "raw_to_drizzled_claimed": False,
+                  "full_public_dark_matter_closure_claimed": False,
+                  "no_semantics_as_evidence": True,
+              }
+              write_json(os.path.join(LEDGERS, "raw_to_drizzled_numeric_comparison_ledger.json"), comparison_artifact)
+
+              if comparison.get("numeric_replay_supported_strict"):
+                  decision = "raw_to_drizzled_numeric_replay_supported_strict_import_required"
+                  certificate_id = "github_raw_to_drizzled_fix1_numeric_replay_supported_strict_import_required"
+                  raw_to_drizzled_supported = True
+                  next_action = "import_github_artifact_into_drive_and_certify_raw_to_drizzled_numeric_replay"
+              elif comparison.get("comparison_attempted"):
+                  decision = "raw_to_drizzled_numeric_comparison_completed_not_strict_pass"
+                  certificate_id = "github_raw_to_drizzled_fix1_numeric_comparison_completed_not_strict_pass"
+                  raw_to_drizzled_supported = False
+                  next_action = "import_github_artifact_and_adjudicate_numeric_mismatch_or_threshold"
+              else:
+                  reason = comparison.get("reason") or "unknown_blocker"
+                  if reason == "no_generated_drizzled_candidate_found" and not commands:
+                      decision = "raw_to_drizzled_rerun_blocked_no_generation_command_or_discoverable_script"
+                      certificate_id = "github_raw_to_drizzled_fix1_blocked_no_generation_command_or_discoverable_script"
+                      next_action = "supply_explicit_raw_to_drizzled_command_or_add_repo_generation_script"
+                  else:
+                      decision = f"raw_to_drizzled_rerun_blocked_{reason}"
+                      certificate_id = f"github_raw_to_drizzled_fix1_blocked_{reason}"
+                      next_action = "import_github_artifact_and_fix_blocker_before_claim"
+                  raw_to_drizzled_supported = False
+
+              certificate = {
+                  "timestamp_utc": now(),
+                  "stage_tag": STAGE_TAG,
+                  "certificate_id": certificate_id,
+                  "decision": decision,
+                  "reference_download_ok": bool(reference_download.get("ok")),
+                  "reference_fits_openable": bool(reference_inspection.get("fits_openable")),
+                  "reference_raw_like_scope_fixed_to_basename_only": True,
+                  "reference_auxiliary_or_raw_like": bool(reference_inspection.get("auxiliary_or_raw_like")),
+                  "command_strategy": command_strategy,
+                  "candidate_commands": commands,
+                  "command_attempt_count": len(command_results),
+                  "generated_candidate_count": len(generated_candidates),
+                  "selected_generated_path": selected_generated.get("path_rel_repo") if selected_generated else None,
+                  "comparison_attempted": bool(comparison.get("comparison_attempted")),
+                  "raw_to_drizzled_numeric_replay_supported_strict": raw_to_drizzled_supported,
+                  "raw_to_drizzled_claimed": False,
+                  "full_public_dark_matter_closure_claimed": False,
+                  "claim_ceiling": "github_numeric_artifact_requires_colab_drive_import_before_public_closure_claim",
+                  "next_action": next_action,
+                  "no_semantics_as_evidence": True,
+              }
+              write_json(os.path.join(RESULTS, "certificate.json"), certificate)
+
+              route_settlement = {
+                  "timestamp_utc": now(),
+                  "stage_tag": STAGE_TAG,
+                  "route": "github_raw_to_drizzled_verified_hlsp_rerun_fix1",
+                  "settlement": decision,
+                  "certificate_id": certificate_id,
+                  "scientific_failure": False if "blocked" in decision else None,
+                  "administrative_or_artifact_blocker": "blocked" in decision,
+                  "next_route": next_action,
+                  "raw_to_drizzled_claimed": False,
+                  "full_public_dark_matter_closure_claimed": False,
+                  "no_semantics_as_evidence": True,
+              }
+              write_json(os.path.join(RESULTS, "route_settlement.json"), route_settlement)
+
+              stage_summary = {
+                  "timestamp_utc": now(),
+                  "stage_tag": STAGE_TAG,
+                  "certificate_id": certificate_id,
+                  "decision": decision,
+                  "hlsp_reference_url": HLSP_REFERENCE_URL,
+                  "reference_download_ok": bool(reference_download.get("ok")),
+                  "reference_fits_openable": bool(reference_inspection.get("fits_openable")),
+                  "reference_shape": reference_inspection.get("selected_shape"),
+                  "reference_raw_like_scope_fixed_to_basename_only": True,
+                  "reference_auxiliary_or_raw_like": bool(reference_inspection.get("auxiliary_or_raw_like")),
+                  "command_strategy": command_strategy,
+                  "candidate_command_count": len(commands),
+                  "command_attempt_count": len(command_results),
+                  "generated_candidate_count": len(generated_candidates),
+                  "inspected_generated_candidate_count": len(inspected_generated),
+                  "selected_generated_path": selected_generated.get("path_rel_repo") if selected_generated else None,
+                  "comparison_attempted": bool(comparison.get("comparison_attempted")),
+                  "numeric_replay_supported_strict": raw_to_drizzled_supported,
+                  "numeric_comparison_brief": {
+                      k: comparison.get(k)
+                      for k in [
+                          "same_shape", "finite_fraction", "max_abs_diff", "p95_abs_diff",
+                          "p99_abs_diff", "rms_abs_diff", "allclose_rtol_1e_6_atol_1e_8",
+                          "numeric_replay_supported_strict", "reason", "error"
+                      ]
+                      if k in comparison
+                  },
+                  "runtime_seconds": float(time.time() - run_started),
+                  "next_action": next_action,
+                  "raw_to_drizzled_claimed": False,
+                  "full_public_dark_matter_closure_claimed": False,
+              }
+              write_json(os.path.join(RESULTS, "stage_summary.json"), stage_summary)
+
+              readme = []
+              readme.append("# TI Paper II Raw-to-Drizzled Verified HLSP Rerun Fix1 Artifact")
+              readme.append("")
+              readme.append(f"Decision: {decision}")
+              readme.append(f"Certificate: {certificate_id}")
+              readme.append("")
+              readme.append("This workflow does not claim full public closure by itself.")
+              readme.append("Import this artifact into Drive, freeze it, and certify the numeric replay or blocker.")
+              readme.append("")
+              readme.append("Fix1 changes:")
+              readme.append("- corrects the reference raw-like false positive caused by parent repo path")
+              readme.append("- inventories repo scripts and generated FITS products before/after generation")
+              readme.append("- runs explicit raw_to_drizzled_command when supplied")
+              readme.append("- optionally runs bounded obvious repo-local generation scripts when no command is supplied")
+              write_text(os.path.join(RESULTS, "README_NEXT_ACTION.md"), "\n".join(readme))
+
+              receipts = {"timestamp_utc": now(), "stage_tag": STAGE_TAG, "files": []}
+              for dirpath, dirnames, filenames in os.walk(RESULTS):
+                  for fn in filenames:
+                      p = os.path.join(dirpath, fn)
+                      receipts["files"].append({"path_rel_results": os.path.relpath(p, RESULTS), "receipt": sha256_file(p)})
+              write_json(os.path.join(RESULTS, "artifact_receipts.json"), receipts)
+
+              print(json.dumps(stage_summary, indent=2, sort_keys=True))
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as e:
+                  error_artifact = {
+                      "timestamp_utc": now(),
+                      "stage_tag": STAGE_TAG,
+                      "decision": "github_raw_to_drizzled_fix1_harness_error",
+                      "certificate_id": "github_raw_to_drizzled_fix1_harness_error",
+                      "error": repr(e),
+                      "traceback": traceback.format_exc(),
+                      "raw_to_drizzled_claimed": False,
+                      "full_public_dark_matter_closure_claimed": False,
+                      "no_semantics_as_evidence": True,
+                  }
+                  write_json(os.path.join(RESULTS, "certificate.json"), error_artifact)
+                  write_json(os.path.join(RESULTS, "stage_summary.json"), error_artifact)
+                  print(json.dumps(error_artifact, indent=2, sort_keys=True))
+          PY
+
+      - name: Run smarter governed comparison harness
+        shell: bash
+        env:
+          HLSP_REFERENCE_URL: ${{ inputs.hlsp_reference_url }}
+          RAW_TO_DRIZZLED_COMMAND: ${{ inputs.raw_to_drizzled_command }}
+          ALLOW_BOUNDED_AUTO_COMMAND_DISCOVERY: ${{ inputs.allow_bounded_auto_command_discovery }}
+          GENERATED_DRIZZLED_GLOB: ${{ inputs.generated_drizzled_glob }}
+        run: |
+          set +e
+          python ti_work/ti_raw_to_drizzled_verified_reference_harness_fix1.py > ti_work/results/logs/harness_fix1.stdout.log 2> ti_work/results/logs/harness_fix1.stderr.log
+          status=$?
+          echo "${status}" > ti_work/results/logs/harness_fix1.exit_status.txt
+          cat ti_work/results/logs/harness_fix1.stdout.log || true
+          exit 0
+
+      - name: Package artifact
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ti_work
+          zip -r ti-paper-ii-raw-to-drizzled-verified-hlsp-rerun-fix1-results.zip results
+          cp ti-paper-ii-raw-to-drizzled-verified-hlsp-rerun-fix1-results.zip results/
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ti-paper-ii-raw-to-drizzled-verified-hlsp-rerun-fix1-results
+          path: ti_work/results/**
+          if-no-files-found: warn
