@@ -1,0 +1,720 @@
+name: TI Paper II Raw-to-Drizzled Fast Manifest Fix3
+
+on:
+  workflow_dispatch:
+    inputs:
+      hlsp_reference_url:
+        description: "Verified public HLSP drizzled SCI FITS reference URL from fix11_fix10"
+        required: true
+        default: "https://mast.stsci.edu/api/v0.1/Download/file?uri=mast%3AHLSP%2Furl%2Fcgi-bin%2Fgetdata.cgi%3Fdataset%3Dhlsp_frontier_hst_wfc3-30mas_macs0416_f125w_v1.0_drz"
+        type: string
+      target_query_tokens:
+        description: "Target tokens used to filter MAST observations"
+        required: true
+        default: "MACS0416,MACS J0416.1-2403,MACSJ0416.1-2403,0416"
+        type: string
+      filter_name:
+        description: "HST filter for the raw-to-drizzled manifest"
+        required: true
+        default: "F125W"
+        type: string
+      instrument_name:
+        description: "HST instrument constraint"
+        required: true
+        default: "WFC3/IR"
+        type: string
+      max_products:
+        description: "Maximum FLT/FLC products to put in manifest"
+        required: true
+        default: "40"
+        type: string
+      max_obsids:
+        description: "Maximum MAST obsids to inspect"
+        required: true
+        default: "120"
+        type: string
+      precheck_download_routes:
+        description: "Perform lightweight HEAD/range prechecks on selected FLT/FLC dataURIs"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+jobs:
+  fast_manifest_fix3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install manifest dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install numpy astropy requests astroquery
+
+      - name: Prepare result directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ti_work/results/logs
+          mkdir -p ti_work/results/ledgers
+          mkdir -p ti_work/results/contracts
+          mkdir -p ti_work/results/reports
+
+      - name: Write fast manifest harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > ti_work/ti_fast_manifest_fix3.py <<'PY'
+          import os
+          import re
+          import csv
+          import json
+          import time
+          import gzip
+          import hashlib
+          import traceback
+          from io import BytesIO
+          from datetime import datetime, timezone
+          from urllib.parse import urlencode
+
+          import requests
+
+          try:
+              from astroquery.mast import Observations
+              ASTROQUERY_AVAILABLE = True
+              ASTROQUERY_ERROR = None
+          except Exception as e:
+              Observations = None
+              ASTROQUERY_AVAILABLE = False
+              ASTROQUERY_ERROR = repr(e)
+
+          STAGE_TAG = "github_fast_manifest_fix3_raw_to_drizzled_input_compiler"
+          FIX10_CERTIFICATE = "phase4z6_fix11_fix10_mast_exact_datauri_public_hlsp_drizzled_sci_reference_download_verified_contract_compiled"
+          FIX12_CERTIFICATE = "phase4z6_fix11_fix12_imported_fix1_missing_generator_blocker_self_contained_generator_workflow_compiled"
+
+          HLSP_REFERENCE_URL = os.environ.get("HLSP_REFERENCE_URL", "").strip()
+          TARGET_QUERY_TOKENS = [x.strip() for x in os.environ.get("TARGET_QUERY_TOKENS", "").split(",") if x.strip()]
+          FILTER_NAME = os.environ.get("FILTER_NAME", "F125W").strip().upper()
+          INSTRUMENT_NAME = os.environ.get("INSTRUMENT_NAME", "WFC3/IR").strip()
+          MAX_PRODUCTS = int(os.environ.get("MAX_PRODUCTS", "40").strip() or "40")
+          MAX_OBSIDS = int(os.environ.get("MAX_OBSIDS", "120").strip() or "120")
+          PRECHECK_DOWNLOAD_ROUTES = os.environ.get("PRECHECK_DOWNLOAD_ROUTES", "true").strip().lower() == "true"
+
+          REPO_ROOT = os.getcwd()
+          RESULTS = os.path.join(REPO_ROOT, "ti_work", "results")
+          LEDGERS = os.path.join(RESULTS, "ledgers")
+          CONTRACTS = os.path.join(RESULTS, "contracts")
+          REPORTS = os.path.join(RESULTS, "reports")
+          LOGS = os.path.join(RESULTS, "logs")
+
+          for p in [RESULTS, LEDGERS, CONTRACTS, REPORTS, LOGS]:
+              os.makedirs(p, exist_ok=True)
+
+          MAST_DOWNLOAD_URL = "https://mast.stsci.edu/api/v0.1/Download/file"
+
+          FLT_EXTENSIONS = ("_flt.fits", "_flc.fits", "_flt.fits.gz", "_flc.fits.gz")
+          BAD_PRODUCT_TOKENS = [
+              "wht", "weight", "ctx", "context", "rms", "ivar", "mask",
+              "seg", "segm", "bkg", "background", "psf", "cat", "catalog",
+              "tar", "tar.gz", "zip", "raw", "asn", "readme",
+              "html", "png", "jpg", "jpeg", "gif", "pdf", "ecsv", "xml", "log"
+          ]
+
+          def now():
+              return datetime.now(timezone.utc).isoformat()
+
+          def write_json(path, obj):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              tmp = path + ".tmp"
+              with open(tmp, "w", encoding="utf-8") as f:
+                  json.dump(obj, f, indent=2, sort_keys=True, ensure_ascii=False)
+              os.replace(tmp, path)
+
+          def write_csv(path, rows, fieldnames):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              tmp = path + ".tmp"
+              with open(tmp, "w", encoding="utf-8", newline="") as f:
+                  w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                  w.writeheader()
+                  for row in rows:
+                      clean = {}
+                      for k, v in row.items():
+                          if isinstance(v, (list, tuple, dict)):
+                              clean[k] = json.dumps(v, sort_keys=True, ensure_ascii=False)
+                          else:
+                              clean[k] = v
+                      w.writerow(clean)
+              os.replace(tmp, path)
+
+          def write_text(path, text):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              tmp = path + ".tmp"
+              with open(tmp, "w", encoding="utf-8") as f:
+                  f.write(text)
+              os.replace(tmp, path)
+
+          def norm_compact(s):
+              return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
+
+          def row_get(row, name, default=""):
+              try:
+                  if hasattr(row, "colnames") and name in row.colnames:
+                      return row[name]
+                  if hasattr(row, "_table") and name in row._table.colnames:
+                      return row[name]
+              except Exception:
+                  pass
+              try:
+                  return row[name]
+              except Exception:
+                  return default
+
+          def mast_download_url(uri):
+              return MAST_DOWNLOAD_URL + "?" + urlencode({"uri": uri})
+
+          def is_flt_or_flc_filename(name):
+              low = str(name or "").lower()
+              return low.endswith(FLT_EXTENSIONS)
+
+          def is_bad_auxiliary_product(text):
+              n = norm_compact(text)
+              return any(norm_compact(tok) in n for tok in BAD_PRODUCT_TOKENS)
+
+          def product_is_candidate(row):
+              fn = str(row_get(row, "productFilename", ""))
+              desc = str(row_get(row, "productSubGroupDescription", ""))
+              uri = str(row_get(row, "dataURI", ""))
+              text = " ".join([fn, desc, uri]).lower()
+
+              if not is_flt_or_flc_filename(fn):
+                  return False
+              if is_bad_auxiliary_product(fn) and not ("_flt" in fn.lower() or "_flc" in fn.lower()):
+                  return False
+              if FILTER_NAME.lower() not in text and FILTER_NAME.replace("F", "f").lower() not in text:
+                  return False
+              return True
+
+          def http_head_or_range(url, nbytes=4096, timeout=45):
+              out = {
+                  "url": url,
+                  "ok": False,
+                  "status_code": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "accept_ranges": None,
+                  "final_url": url,
+                  "range_ok": False,
+                  "range_status_code": None,
+                  "range_bytes": 0,
+                  "partial_fits_like_magic": False,
+                  "error": None,
+              }
+              headers = {"User-Agent": "TI-PaperII-FastManifestFix3/1.0"}
+              try:
+                  r = requests.head(url, headers=headers, timeout=timeout, allow_redirects=True)
+                  out["status_code"] = int(r.status_code)
+                  out["content_type"] = r.headers.get("content-type")
+                  out["content_length"] = int(r.headers.get("content-length", "0") or 0)
+                  out["accept_ranges"] = r.headers.get("accept-ranges")
+                  out["final_url"] = r.url
+                  out["ok"] = 200 <= r.status_code < 400
+              except Exception as e:
+                  out["error"] = "HEAD:" + repr(e)
+
+              try:
+                  rr = requests.get(url, headers={**headers, "Range": f"bytes=0-{nbytes-1}"}, timeout=timeout, allow_redirects=True)
+                  out["range_status_code"] = int(rr.status_code)
+                  if 200 <= rr.status_code < 400:
+                      content = rr.content[:nbytes]
+                      out["range_ok"] = True
+                      out["range_bytes"] = len(content)
+                      if content.startswith(b"\x1f\x8b"):
+                          try:
+                              content = gzip.GzipFile(fileobj=BytesIO(content)).read(nbytes)
+                          except Exception:
+                              pass
+                      try:
+                          text = content.decode("ascii", errors="ignore")
+                          out["partial_fits_like_magic"] = text.startswith("SIMPLE") or "XTENSION" in text[:4096]
+                      except Exception:
+                          pass
+              except Exception as e:
+                  out["range_error"] = repr(e)
+
+              return out
+
+          def query_mast_observations():
+              ledger = {
+                  "attempted": True,
+                  "astroquery_available": ASTROQUERY_AVAILABLE,
+                  "astroquery_error": ASTROQUERY_ERROR,
+                  "target_query_tokens": TARGET_QUERY_TOKENS,
+                  "filter_name": FILTER_NAME,
+                  "instrument_name": INSTRUMENT_NAME,
+                  "query_attempts": [],
+                  "obs_rows": [],
+                  "selected_obsids": [],
+                  "error": None,
+              }
+              if not ASTROQUERY_AVAILABLE:
+                  ledger["error"] = "astroquery_unavailable"
+                  return ledger
+
+              obs_tables = []
+              for target in TARGET_QUERY_TOKENS:
+                  try:
+                      obs = Observations.query_criteria(
+                          obs_collection="HST",
+                          filters=FILTER_NAME,
+                          instrument_name=INSTRUMENT_NAME,
+                          target_name=target,
+                      )
+                      ledger["query_attempts"].append({
+                          "kind": "target_name_query",
+                          "target": target,
+                          "row_count": int(len(obs)),
+                          "error": None,
+                      })
+                      if len(obs) > 0:
+                          obs_tables.append(obs)
+                  except Exception as e:
+                      ledger["query_attempts"].append({
+                          "kind": "target_name_query",
+                          "target": target,
+                          "row_count": 0,
+                          "error": repr(e),
+                      })
+
+              if not obs_tables:
+                  try:
+                      obs = Observations.query_criteria(
+                          obs_collection="HST",
+                          filters=FILTER_NAME,
+                          instrument_name=INSTRUMENT_NAME,
+                      )
+                      ledger["query_attempts"].append({
+                          "kind": "broad_filter_instrument_query",
+                          "target": "",
+                          "row_count": int(len(obs)),
+                          "error": None,
+                      })
+                      obs_tables.append(obs)
+                  except Exception as e:
+                      ledger["query_attempts"].append({
+                          "kind": "broad_filter_instrument_query",
+                          "target": "",
+                          "row_count": 0,
+                          "error": repr(e),
+                      })
+                      ledger["error"] = "broad_query_failed"
+                      return ledger
+
+              obsids = []
+              obs_rows = []
+
+              target_compact_tokens = [norm_compact(x) for x in TARGET_QUERY_TOKENS]
+              for obs in obs_tables:
+                  colnames = list(getattr(obs, "colnames", []))
+                  for row in obs:
+                      row_text = " ".join(str(row_get(row, col, "")) for col in colnames)
+                      compact = norm_compact(row_text)
+                      target_match = any(tok and tok in compact for tok in target_compact_tokens) or "0416" in compact or "macs" in compact
+                      if not target_match:
+                          continue
+                      obsid = str(row_get(row, "obsid", ""))
+                      if not obsid:
+                          continue
+                      obsids.append(obsid)
+                      obs_rows.append({col: str(row_get(row, col, "")) for col in colnames[:50]})
+
+              obsids = list(dict.fromkeys(obsids))[:MAX_OBSIDS]
+              ledger["selected_obsids"] = obsids
+              ledger["obs_rows"] = obs_rows[:500]
+              return ledger
+
+          def query_products_for_obsids(obsids):
+              ledger = {
+                  "attempted": bool(obsids),
+                  "obsid_count": len(obsids),
+                  "product_query_errors": [],
+                  "raw_product_count": 0,
+                  "candidate_product_count": 0,
+                  "candidate_products": [],
+              }
+              if not ASTROQUERY_AVAILABLE:
+                  ledger["product_query_errors"].append({"error": "astroquery_unavailable"})
+                  return ledger
+
+              candidates = []
+              for obsid in obsids:
+                  try:
+                      prods = Observations.get_product_list(obsid)
+                      ledger["raw_product_count"] += int(len(prods))
+                      pcols = list(getattr(prods, "colnames", []))
+                      for p in prods:
+                          if not product_is_candidate(p):
+                              continue
+                          row = {col: str(row_get(p, col, "")) for col in pcols}
+                          row["obsid"] = obsid
+                          row["productFilename"] = str(row_get(p, "productFilename", ""))
+                          row["dataURI"] = str(row_get(p, "dataURI", ""))
+                          row["productSubGroupDescription"] = str(row_get(p, "productSubGroupDescription", ""))
+                          row["download_url"] = mast_download_url(row["dataURI"]) if row["dataURI"] else ""
+                          row["manifest_rank_precheck"] = len(candidates) + 1
+                          row["manifest_candidate_reason"] = "FLT/FLC product filename with requested filter"
+                          candidates.append(row)
+                  except Exception as e:
+                      ledger["product_query_errors"].append({"obsid": obsid, "error": repr(e)})
+
+              candidates = sorted(
+                  candidates,
+                  key=lambda r: (
+                      r.get("productFilename", ""),
+                      r.get("dataURI", ""),
+                  )
+              )
+              seen = set()
+              deduped = []
+              for row in candidates:
+                  key = row.get("dataURI") or row.get("productFilename")
+                  if not key or key in seen:
+                      continue
+                  seen.add(key)
+                  deduped.append(row)
+
+              ledger["candidate_products"] = deduped[:MAX_PRODUCTS]
+              ledger["candidate_product_count"] = len(ledger["candidate_products"])
+              return ledger
+
+          def precheck_products(products):
+              rows = []
+              if not PRECHECK_DOWNLOAD_ROUTES:
+                  return rows
+              for idx, row in enumerate(products, start=1):
+                  url = row.get("download_url")
+                  if not url:
+                      pre = {
+                          "productFilename": row.get("productFilename"),
+                          "dataURI": row.get("dataURI"),
+                          "download_url": "",
+                          "precheck_ok": False,
+                          "precheck_error": "missing_download_url",
+                      }
+                  else:
+                      time.sleep(0.08)
+                      precheck = http_head_or_range(url)
+                      pre = dict(row)
+                      pre.update({
+                          "precheck_ok": bool(precheck.get("ok") or precheck.get("range_ok")),
+                          "http_status_code": precheck.get("status_code"),
+                          "content_type": precheck.get("content_type"),
+                          "content_length": precheck.get("content_length"),
+                          "accept_ranges": precheck.get("accept_ranges"),
+                          "range_ok": precheck.get("range_ok"),
+                          "range_status_code": precheck.get("range_status_code"),
+                          "range_bytes": precheck.get("range_bytes"),
+                          "partial_fits_like_magic": precheck.get("partial_fits_like_magic"),
+                          "final_url": precheck.get("final_url"),
+                          "precheck_error": precheck.get("error"),
+                      })
+                  pre["manifest_rank"] = idx
+                  rows.append(pre)
+              return rows
+
+          def main():
+              started = time.time()
+
+              sanity = {
+                  "timestamp_utc": now(),
+                  "stage_tag": STAGE_TAG,
+                  "github_actions": True,
+                  "hlsp_reference_url": HLSP_REFERENCE_URL,
+                  "target_query_tokens": TARGET_QUERY_TOKENS,
+                  "filter_name": FILTER_NAME,
+                  "instrument_name": INSTRUMENT_NAME,
+                  "max_products": MAX_PRODUCTS,
+                  "max_obsids": MAX_OBSIDS,
+                  "precheck_download_routes": PRECHECK_DOWNLOAD_ROUTES,
+                  "manifest_only": True,
+                  "no_full_fits_downloads_except_range_prechecks": True,
+                  "no_astrodrizzle": True,
+                  "raw_to_drizzled_claimed": False,
+                  "full_public_dark_matter_closure_claimed": False,
+                  "no_semantics_as_evidence": True,
+              }
+              write_json(os.path.join(RESULTS, "mount_root_sanity.json"), sanity)
+
+              predecessor = {
+                  "timestamp_utc": now(),
+                  "stage_tag": STAGE_TAG,
+                  "fix10_certificate": FIX10_CERTIFICATE,
+                  "fix12_certificate": FIX12_CERTIFICATE,
+                  "claim_ceiling": "fast_manifest_only_no_raw_to_drizzled_numeric_replay",
+                  "raw_to_drizzled_claimed": False,
+                  "full_public_dark_matter_closure_claimed": False,
+              }
+              write_json(os.path.join(CONTRACTS, "predecessor_contract.json"), predecessor)
+
+              ref_precheck = http_head_or_range(HLSP_REFERENCE_URL, nbytes=4096)
+              write_json(os.path.join(LEDGERS, "hlsp_reference_route_precheck.json"), ref_precheck)
+
+              obs_ledger = query_mast_observations()
+              write_json(os.path.join(LEDGERS, "mast_observation_query_ledger.json"), obs_ledger)
+
+              products_ledger = query_products_for_obsids(obs_ledger.get("selected_obsids", []))
+              write_json(os.path.join(LEDGERS, "mast_flt_flc_product_query_ledger.json"), products_ledger)
+
+              precheck_rows = precheck_products(products_ledger.get("candidate_products", []))
+              write_json(os.path.join(LEDGERS, "mast_flt_flc_datauri_precheck_ledger.json"), {
+                  "timestamp_utc": now(),
+                  "precheck_attempted": PRECHECK_DOWNLOAD_ROUTES,
+                  "precheck_row_count": len(precheck_rows),
+                  "precheck_ok_count": sum(1 for r in precheck_rows if r.get("precheck_ok")),
+                  "precheck_rows": precheck_rows,
+              })
+
+              selected_manifest_rows = precheck_rows if PRECHECK_DOWNLOAD_ROUTES else products_ledger.get("candidate_products", [])
+              if PRECHECK_DOWNLOAD_ROUTES:
+                  selected_manifest_rows = sorted(
+                      precheck_rows,
+                      key=lambda r: (
+                          0 if r.get("precheck_ok") else 1,
+                          r.get("productFilename", ""),
+                      )
+                  )[:MAX_PRODUCTS]
+
+              manifest = {
+                  "timestamp_utc": now(),
+                  "stage_tag": STAGE_TAG,
+                  "manifest_id": "ti_paper_ii_macs0416_f125w_raw_to_drizzled_manifest_fix3",
+                  "hlsp_reference_url": HLSP_REFERENCE_URL,
+                  "target_query_tokens": TARGET_QUERY_TOKENS,
+                  "filter_name": FILTER_NAME,
+                  "instrument_name": INSTRUMENT_NAME,
+                  "obsid_count": len(obs_ledger.get("selected_obsids", [])),
+                  "candidate_product_count": products_ledger.get("candidate_product_count", 0),
+                  "selected_product_count": len(selected_manifest_rows),
+                  "selected_products": selected_manifest_rows,
+                  "datauri_csv": ",".join([r.get("dataURI", "") for r in selected_manifest_rows if r.get("dataURI")]),
+                  "colab_generation_contract": {
+                      "recommended_stage": "phase4z6_fix11_fix14_bfc1_colab_drive_raw_to_drizzled_from_manifest_01",
+                      "execution_location": "Google Colab with Google Drive persistence",
+                      "do_not_upload_large_fits_to_github": True,
+                      "steps": [
+                          "download selected FLT/FLC products from dataURI manifest into Drive",
+                          "run AstroDrizzle in Colab or record drizzlepac blocker",
+                          "compare generated drizzled SCI output to verified HLSP reference",
+                          "write hashes/WCS/shape/parameter/numeric-comparison ledgers",
+                          "persist only small certification artifacts unless debugging requires FITS"
+                      ],
+                  },
+                  "claim_ceiling": "input_manifest_only_no_raw_to_drizzled_numeric_replay",
+                  "raw_to_drizzled_claimed": False,
+                  "full_public_dark_matter_closure_claimed": False,
+                  "no_semantics_as_evidence": True,
+              }
+              write_json(os.path.join(CONTRACTS, "raw_to_drizzled_colab_generation_manifest_fix3.json"), manifest)
+
+              write_csv(
+                  os.path.join(CONTRACTS, "raw_to_drizzled_colab_generation_manifest_fix3.csv"),
+                  selected_manifest_rows,
+                  [
+                      "manifest_rank", "obsid", "productFilename", "dataURI", "download_url",
+                      "productSubGroupDescription", "precheck_ok", "http_status_code",
+                      "content_type", "content_length", "range_ok", "range_status_code",
+                      "range_bytes", "partial_fits_like_magic", "final_url",
+                      "manifest_candidate_reason",
+                  ],
+              )
+
+              if not ASTROQUERY_AVAILABLE:
+                  decision = "fast_manifest_blocked_astroquery_unavailable"
+                  certificate_id = "github_fast_manifest_fix3_blocked_astroquery_unavailable"
+                  next_action = "install_or_repair_astroquery_or_run_manifest_compiler_in_colab"
+              elif not obs_ledger.get("selected_obsids"):
+                  decision = "fast_manifest_blocked_no_matching_mast_obsids"
+                  certificate_id = "github_fast_manifest_fix3_blocked_no_matching_mast_obsids"
+                  next_action = "adjust_target_query_tokens_or_use_known_datauri_manifest"
+              elif not products_ledger.get("candidate_products"):
+                  decision = "fast_manifest_blocked_no_flt_flc_products"
+                  certificate_id = "github_fast_manifest_fix3_blocked_no_flt_flc_products"
+                  next_action = "adjust_product_filter_or_supply_known_flt_datauri_csv"
+              elif not selected_manifest_rows:
+                  decision = "fast_manifest_blocked_no_selected_products"
+                  certificate_id = "github_fast_manifest_fix3_blocked_no_selected_products"
+                  next_action = "inspect_product_query_ledger_or_precheck_settings"
+              else:
+                  decision = "fast_manifest_compiled_colab_generation_contract_ready"
+                  certificate_id = "github_fast_manifest_fix3_colab_generation_contract_ready"
+                  next_action = "import_manifest_artifact_into_drive_then_run_colab_raw_to_drizzled_from_manifest"
+
+              certificate = {
+                  "timestamp_utc": now(),
+                  "stage_tag": STAGE_TAG,
+                  "certificate_id": certificate_id,
+                  "decision": decision,
+                  "manifest_only": True,
+                  "hlsp_reference_precheck_ok": bool(ref_precheck.get("ok") or ref_precheck.get("range_ok")),
+                  "astroquery_available": ASTROQUERY_AVAILABLE,
+                  "obsid_count": len(obs_ledger.get("selected_obsids", [])),
+                  "candidate_product_count": products_ledger.get("candidate_product_count", 0),
+                  "selected_product_count": len(selected_manifest_rows),
+                  "precheck_ok_count": sum(1 for r in precheck_rows if r.get("precheck_ok")),
+                  "manifest_json": "contracts/raw_to_drizzled_colab_generation_manifest_fix3.json",
+                  "manifest_csv": "contracts/raw_to_drizzled_colab_generation_manifest_fix3.csv",
+                  "claim_ceiling": "fast_manifest_only_no_raw_to_drizzled_numeric_replay",
+                  "raw_to_drizzled_claimed": False,
+                  "full_public_dark_matter_closure_claimed": False,
+                  "next_action": next_action,
+                  "allowed_claims": [
+                      "GitHub compiled a bounded public FLT/FLC manifest.",
+                      "This artifact is small and does not contain heavy FITS products.",
+                      "The heavy raw-to-drizzled generation must run in Colab/Drive before any numeric replay claim."
+                  ],
+                  "forbidden_claims": [
+                      "raw-to-drizzled replay solved",
+                      "full public dark matter closure",
+                      "numeric equality from manifest compilation",
+                      "science evidence from filenames or tokens"
+                  ],
+                  "no_semantics_as_evidence": True,
+              }
+              write_json(os.path.join(RESULTS, "certificate.json"), certificate)
+
+              route_settlement = {
+                  "timestamp_utc": now(),
+                  "stage_tag": STAGE_TAG,
+                  "route": "github_fast_manifest_fix3_raw_to_drizzled_input_compiler",
+                  "settlement": decision,
+                  "certificate_id": certificate_id,
+                  "scientific_failure": False,
+                  "administrative_or_artifact_blocker": "blocked" in decision,
+                  "next_route": next_action,
+                  "raw_to_drizzled_claimed": False,
+                  "full_public_dark_matter_closure_claimed": False,
+                  "no_semantics_as_evidence": True,
+              }
+              write_json(os.path.join(RESULTS, "route_settlement.json"), route_settlement)
+
+              stage_summary = {
+                  "timestamp_utc": now(),
+                  "stage_tag": STAGE_TAG,
+                  "certificate_id": certificate_id,
+                  "decision": decision,
+                  "manifest_only": True,
+                  "runtime_seconds": float(time.time() - started),
+                  "hlsp_reference_precheck_ok": bool(ref_precheck.get("ok") or ref_precheck.get("range_ok")),
+                  "astroquery_available": ASTROQUERY_AVAILABLE,
+                  "obsid_count": len(obs_ledger.get("selected_obsids", [])),
+                  "candidate_product_count": products_ledger.get("candidate_product_count", 0),
+                  "selected_product_count": len(selected_manifest_rows),
+                  "precheck_row_count": len(precheck_rows),
+                  "precheck_ok_count": sum(1 for r in precheck_rows if r.get("precheck_ok")),
+                  "artifact_expected_size": "small_json_csv_only",
+                  "next_action": next_action,
+                  "raw_to_drizzled_claimed": False,
+                  "full_public_dark_matter_closure_claimed": False,
+              }
+              write_json(os.path.join(RESULTS, "stage_summary.json"), stage_summary)
+
+              readme = []
+              readme.append("# TI Paper II Fast Manifest Fix3 Artifact")
+              readme.append("")
+              readme.append(f"Decision: {decision}")
+              readme.append(f"Certificate: {certificate_id}")
+              readme.append("")
+              readme.append("This is a fast manifest-only artifact.")
+              readme.append("It does not run AstroDrizzle and does not claim raw-to-drizzled replay.")
+              readme.append("")
+              readme.append("Import the manifest into Drive and run the heavy raw-to-drizzled generation in Colab.")
+              readme.append("")
+              readme.append("Important files:")
+              readme.append("- contracts/raw_to_drizzled_colab_generation_manifest_fix3.json")
+              readme.append("- contracts/raw_to_drizzled_colab_generation_manifest_fix3.csv")
+              readme.append("- ledgers/mast_observation_query_ledger.json")
+              readme.append("- ledgers/mast_flt_flc_product_query_ledger.json")
+              readme.append("- ledgers/mast_flt_flc_datauri_precheck_ledger.json")
+              write_text(os.path.join(RESULTS, "README_NEXT_ACTION.md"), "\n".join(readme))
+
+              receipts = {"timestamp_utc": now(), "stage_tag": STAGE_TAG, "files": []}
+              for dirpath, dirnames, filenames in os.walk(RESULTS):
+                  for fn in filenames:
+                      p = os.path.join(dirpath, fn)
+                      with open(p, "rb") as f:
+                          h = hashlib.sha256(f.read()).hexdigest()
+                      receipts["files"].append({
+                          "path_rel_results": os.path.relpath(p, RESULTS),
+                          "size_bytes": os.path.getsize(p),
+                          "sha256": h,
+                      })
+              write_json(os.path.join(RESULTS, "artifact_receipts.json"), receipts)
+
+              print(json.dumps(stage_summary, indent=2, sort_keys=True))
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as e:
+                  error_artifact = {
+                      "timestamp_utc": now(),
+                      "stage_tag": STAGE_TAG,
+                      "decision": "github_fast_manifest_fix3_harness_error",
+                      "certificate_id": "github_fast_manifest_fix3_harness_error",
+                      "error": repr(e),
+                      "traceback": traceback.format_exc(),
+                      "raw_to_drizzled_claimed": False,
+                      "full_public_dark_matter_closure_claimed": False,
+                      "no_semantics_as_evidence": True,
+                  }
+                  write_json(os.path.join(RESULTS, "certificate.json"), error_artifact)
+                  write_json(os.path.join(RESULTS, "stage_summary.json"), error_artifact)
+                  print(json.dumps(error_artifact, indent=2, sort_keys=True))
+          PY
+
+      - name: Run fast manifest harness
+        shell: bash
+        env:
+          HLSP_REFERENCE_URL: ${{ inputs.hlsp_reference_url }}
+          TARGET_QUERY_TOKENS: ${{ inputs.target_query_tokens }}
+          FILTER_NAME: ${{ inputs.filter_name }}
+          INSTRUMENT_NAME: ${{ inputs.instrument_name }}
+          MAX_PRODUCTS: ${{ inputs.max_products }}
+          MAX_OBSIDS: ${{ inputs.max_obsids }}
+          PRECHECK_DOWNLOAD_ROUTES: ${{ inputs.precheck_download_routes }}
+        run: |
+          set +e
+          python ti_work/ti_fast_manifest_fix3.py > ti_work/results/logs/fast_manifest_fix3.stdout.log 2> ti_work/results/logs/fast_manifest_fix3.stderr.log
+          status=$?
+          echo "${status}" > ti_work/results/logs/fast_manifest_fix3.exit_status.txt
+          cat ti_work/results/logs/fast_manifest_fix3.stdout.log || true
+          exit 0
+
+      - name: Package small manifest artifact
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ti_work
+          zip -r ti-paper-ii-raw-to-drizzled-fast-manifest-fix3-results.zip results
+          cp ti-paper-ii-raw-to-drizzled-fast-manifest-fix3-results.zip results/
+
+      - name: Upload small manifest artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ti-paper-ii-raw-to-drizzled-fast-manifest-fix3-results
+          path: ti_work/results/**
+          if-no-files-found: warn
+          compression-level: 6
